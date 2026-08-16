@@ -8,6 +8,15 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
 
 ## [Unreleased]
 
+### Fixed
+
+- The environment correction now retries. A fresh install's very first ask can find no cached
+  `AppTransaction` (and the fetch can fail on an offline first launch), and 1.0.1 asked
+  exactly once per process, so such installs kept the `appstore` guess for the whole run. The
+  store is re-asked at every flush until it answers, and a flush waits at most three seconds
+  for it, so a slow or offline first launch cannot delay sending; a late answer corrects the
+  label for everything still queued and everything that follows.
+
 ## [1.0.1] - 2026-08-16
 
 ### Fixed

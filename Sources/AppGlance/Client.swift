@@ -30,8 +30,16 @@ actor Client {
     private var inFlight: Task<Void, Never>?
     private var flushTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
-    /// The one-shot environment correction; the first flush waits for it. See `adoptEnvironment`.
+    /// The in-flight ask for the store's environment answer; each flush waits briefly for it.
+    /// See `adoptStoreAnswer`.
     private var refineTask: Task<Void, Never>?
+    /// True once the store has answered (or the environment is a compile-time fact). Until
+    /// then every flush asks again: a fresh install's first ask can find nothing cached.
+    private var environmentAnswered = false
+    /// How long a flush waits for the store's answer before sending with the guessed label -
+    /// a slow or offline first launch must not hold batches hostage; later flushes correct
+    /// what follows.
+    private let environmentAnswerGrace: TimeInterval = 3
     /// Set by `shutdown()` once a later `configure` has replaced this client.
     private var retired = false
 
@@ -185,14 +193,28 @@ actor Client {
         queue.removeAll()
     }
 
-    /// Starts the one-shot environment correction; the facade calls this right after
-    /// `configure`. Separate from init so tests own exactly when (and whether) it runs.
+    /// Starts (or restarts) the ask for the store's environment answer; the facade calls this
+    /// right after `configure`, and `flush()` calls it again while the question is still open.
+    /// Separate from init so tests own exactly when (and whether) it runs.
     func beginEnvironmentRefinement() {
-        guard refineTask == nil, !retired else { return }
-        refineTask = Task { [weak self] in
-            let refined = await AppEnvironment.refined()
-            await self?.adoptEnvironment(refined)
+        guard refineTask == nil, !retired, !environmentAnswered else { return }
+        if AppEnvironment.isCompileTimeDetermined {
+            environmentAnswered = true
+            return
         }
+        refineTask = Task { [weak self] in
+            let answer = await AppEnvironment.storeAnswer()
+            await self?.adoptStoreAnswer(answer)
+        }
+    }
+
+    /// nil means the store had no answer this time: the task slot clears so a later flush asks
+    /// again, and the guessed label stands meanwhile.
+    func adoptStoreAnswer(_ answer: AppEnvironment?) {
+        refineTask = nil
+        guard let answer, !retired, !environmentAnswered else { return }
+        environmentAnswered = true
+        adoptEnvironment(answer)
     }
 
     /// Adopts the store's answer for where this build runs. Queued events carrying this run's
@@ -394,9 +416,19 @@ actor Client {
     func flush() async {
         flushTask?.cancel()
         flushTask = nil
-        // The store answers the environment question milliseconds after configure; waiting for
-        // it here means no batch ever leaves with the guessed label.
-        if let refineTask { await refineTask.value }
+        // Ask again if the store has not answered yet, then wait briefly: the usual case is an
+        // answer in milliseconds and no batch leaves with the guessed label; the offline first
+        // launch sends with the guess after the grace and is corrected at a later flush.
+        beginEnvironmentRefinement()
+        if let refineTask {
+            let grace = environmentAnswerGrace
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { await refineTask.value }
+                group.addTask { try? await Task.sleep(nanoseconds: UInt64(grace * 1_000_000_000)) }
+                await group.next()
+                group.cancelAll()
+            }
+        }
         // The actor suspends inside `drain()`, so a second flush can arrive mid-send. It joins
         // the send in progress instead of racing it - the slice was claimed out of the queue
         // before the await, so nothing is ever sent twice, and a caller holding the process open

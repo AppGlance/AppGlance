@@ -24,23 +24,32 @@ public enum AppEnvironment: String, Sendable, CaseIterable {
         #endif
     }()
 
-    /// `current` corrected against the store's own record.
+    /// True when the environment is a compile-time fact (Simulator, Debug) and the store has
+    /// nothing to add.
+    static var isCompileTimeDetermined: Bool {
+        #if targetEnvironment(simulator)
+        return true
+        #elseif DEBUG
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    /// The store's answer for where this build runs, or nil when it has none right now.
     ///
     /// The receipt heuristic below stopped telling TestFlight and the App Store apart when the
     /// legacy receipt retired with the iOS 18 SDK: both channels now get a URL ending in plain
     /// `receipt`, so a TestFlight install reads as App Store. The signed `AppTransaction` names
-    /// the storefront that actually delivered this build. Simulator and Debug are compile-time
-    /// facts and skip the lookup; a build the store cannot vouch for (ad hoc, enterprise, no
-    /// transaction) keeps the heuristic's answer.
-    static func refined() async -> AppEnvironment {
-        #if targetEnvironment(simulator)
-        return current
-        #elseif DEBUG
-        return current
-        #else
-        guard let transaction = try? await AppTransaction.shared.payloadValue else { return current }
+    /// the storefront that actually delivered this build - but a fresh install may have nothing
+    /// cached to answer with and the fetch can fail (an offline first launch, an ad hoc or
+    /// enterprise build). Callers treat nil as "ask again later", never as an answer, and
+    /// `AppTransaction.refresh()` is not an option: it can put a sign-in prompt on screen,
+    /// which an analytics SDK must never do.
+    static func storeAnswer() async -> AppEnvironment? {
+        guard !isCompileTimeDetermined else { return nil }
+        guard let transaction = try? await AppTransaction.shared.payloadValue else { return nil }
         return refined(from: transaction.environment, fallback: current)
-        #endif
     }
 
     /// `.xcode` means a store-signed build launched by the developer tools; `debug` is the

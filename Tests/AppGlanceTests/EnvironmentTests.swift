@@ -73,6 +73,36 @@ final class EnvironmentTests: XCTestCase {
         XCTAssertTrue(after.isEmpty)
     }
 
+    func testNilStoreAnswerLeavesGuessAndAllowsRetry() async throws {
+        let appID = "env.retry"
+        TestSupport.fresh(appID)
+        let client = Client(
+            config: TestSupport.configuration(appID: appID), userID: "user-1",
+            session: TestSupport.recordingSession())
+        await client.track(signal: "first", metadata: nil)
+
+        await client.adoptStoreAnswer(nil)
+        let unchanged = await client.pendingEvents().map(\.environment)
+        XCTAssertEqual(Set(unchanged), [AppEnvironment.current.rawValue])
+
+        await client.adoptStoreAnswer(.testFlight)
+        let corrected = await client.pendingEvents().map(\.environment)
+        XCTAssertEqual(Set(corrected), ["testflight"])
+    }
+
+    func testStoreAnswerIsAdoptedOnce() async throws {
+        let appID = "env.once"
+        TestSupport.fresh(appID)
+        let client = Client(
+            config: TestSupport.configuration(appID: appID), userID: "user-1",
+            session: TestSupport.recordingSession())
+        await client.adoptStoreAnswer(.testFlight)
+        await client.adoptStoreAnswer(.appStore)
+        await client.track(signal: "after", metadata: nil)
+        let labels = await client.pendingEvents().map(\.environment)
+        XCTAssertEqual(Set(labels), ["testflight"])
+    }
+
     func testAdoptOpensGateForCorrectedEnvironment() async throws {
         let appID = "env.gate.opens"
         TestSupport.fresh(appID)
