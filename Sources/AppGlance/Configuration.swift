@@ -65,9 +65,12 @@ extension AppGlance {
         /// dashboard's map stays empty. Default true.
         public var collectsCountry: Bool
 
-        /// Which environments actually send. Default `[.appStore, .testFlight]`: TestFlight
-        /// events are tagged `testflight` and kept out of the dashboard's Live numbers; Simulator
-        /// and Debug builds send nothing unless `debug` is on.
+        /// Which environments actually send. Default `[.appStore, .testFlight]`: Simulator and
+        /// Debug builds send nothing unless `debug` is on. TestFlight events are designed to be
+        /// tagged `testflight` and kept out of the dashboard's Live numbers, but the split
+        /// between the two store channels is best effort for now: on-device confirmation of the
+        /// store's answer is pending, and TestFlight installs have been observed reporting
+        /// `appstore`. See `AppEnvironment`.
         public var enabledEnvironments: Set<AppEnvironment>
 
         /// Debug mode, for while you wire the SDK up. Default false. When on:

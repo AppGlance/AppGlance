@@ -126,12 +126,18 @@ AppGlance.configure(AppGlance.Configuration(
 
 ### Environments
 
-Every event is tagged `appstore`, `testflight`, `simulator` or `debug`. TestFlight vs App
-Store is read from the store's signed `AppTransaction` (the sandbox receipt heuristic and, on
-macOS, the beta-distribution signing certificate remain as fallbacks for builds the store
-cannot vouch for), and TestFlight events stay out of the dashboard's Live numbers unless you
-choose to include them. Simulator and Debug builds are excluded by the default
-`enabledEnvironments`; debug mode lifts that gate without changing the tag.
+Every event is tagged `appstore`, `testflight`, `simulator` or `debug`. Simulator and Debug
+are compile-time facts and always tagged correctly; they are excluded by the default
+`enabledEnvironments`, and debug mode lifts that gate without changing the tag.
+
+The split between the two store channels is best effort for now. It is designed to come from
+the store's signed `AppTransaction` (the sandbox receipt heuristic and, on macOS, the
+beta-distribution signing certificate remain as fallbacks for builds the store cannot vouch
+for), and the mapping from the store's answer to these tags is covered by tests. On-device
+confirmation from a real TestFlight install is still pending, though, and TestFlight installs
+have been observed reporting `appstore` in the field, so treat the `testflight` versus
+`appstore` distinction as an aid, not a guarantee: events from a TestFlight build can appear
+in the dashboard's Live (App Store) numbers until the store's answer is confirmed on device.
 
 ## Guarantees
 
