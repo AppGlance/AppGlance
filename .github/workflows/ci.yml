@@ -1,9 +1,11 @@
+# Also runs as the gate inside the Release workflow (workflow_call), which is why version
+# tags are not a trigger here: a tag push runs this whole matrix exactly once, through Release.
 name: CI
 on:
   push:
     branches: [main]
-    tags: ["*"]
   pull_request:
+  workflow_call:
 
 jobs:
   lint:

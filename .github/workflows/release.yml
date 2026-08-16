@@ -1,6 +1,7 @@
 # Publishes a GitHub Release for every version tag, with the matching CHANGELOG.md section as
-# its notes. Releasing is: move the [Unreleased] entries under a new version heading, commit,
-# `git tag 1.2.3 && git push origin main 1.2.3`.
+# its notes - but only after the full CI matrix (lint, builds, tests) has passed in this same
+# run, so a tag with a red suite cannot publish. Releasing is: move the [Unreleased] entries
+# under a new version heading, commit, `git tag 1.2.3 && git push origin main 1.2.3`.
 name: Release
 on:
   push:
@@ -10,8 +11,13 @@ permissions:
   contents: write
 
 jobs:
+  checks:
+    name: Checks
+    uses: ./.github/workflows/ci.yml
+
   github-release:
     name: GitHub Release
+    needs: checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
