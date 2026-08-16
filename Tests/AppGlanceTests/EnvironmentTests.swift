@@ -37,11 +37,13 @@ final class EnvironmentTests: XCTestCase {
         let appID = "env.foreign"
         TestSupport.fresh(appID)
         // An event persisted by an earlier run under a different label; this process cannot
-        // vouch for that run's channel, so the correction must not touch it.
+        // vouch for that run's channel, so the correction must not touch it. The label must
+        // differ from every test host's guess (macOS guesses debug, an iOS Simulator host
+        // guesses simulator), or the restamp would legitimately rewrite it.
         let foreign = Event(
             event_id: "11111111-1111-1111-1111-111111111111", session_id: nil, app_id: appID,
             user_id: "user-1", signal: "purchase", app_version: "1.0", os_name: "iOS",
-            os_version: "26.0", environment: "simulator", country: nil,
+            os_version: "26.0", environment: "appstore", country: nil,
             client_ts: Date(timeIntervalSince1970: 1_700_000_000), metadata: nil)
         let data = try EventCoding.makeEncoder().encode([foreign])
         try data.write(to: Client.makeStoreURL(appID: appID), options: .atomic)
@@ -53,7 +55,7 @@ final class EnvironmentTests: XCTestCase {
         await client.adoptEnvironment(.testFlight)
 
         let labels = await client.pendingEvents().map(\.environment).sorted()
-        XCTAssertEqual(labels, ["simulator", "testflight"])
+        XCTAssertEqual(labels, ["appstore", "testflight"], "the foreign label survives; the guessed one is restamped")
     }
 
     func testAdoptDropsQueueWhenGateCloses() async throws {
