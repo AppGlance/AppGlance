@@ -244,7 +244,8 @@ actor Client {
             Log.line(
                 collecting
                     ? "environment corrected to \(refined.rawValue) - this build sends after all"
-                    : "environment corrected to \(refined.rawValue) - not sending: enabledEnvironments doesn't include \(refined.caseName)")
+                    : "environment corrected to \(refined.rawValue)"
+                        + " - not sending: enabledEnvironments doesn't include \(refined.caseName)")
         } else {
             log("environment corrected: \(guessed) is really \(refined.rawValue)")
         }
