@@ -6,8 +6,12 @@ struct Event: Codable, Sendable {
     /// Client-minted UUID. The server ignores a replay of the same `(app_id, event_id)`, which
     /// is what makes retrying a batch safe.
     let event_id: String
-    /// The session this event belongs to (minted at each `session.start`); nil for events
-    /// recorded before an install's first session, such as `install` itself.
+    /// The session this event belongs to. The id exists from client startup on: pre-minted
+    /// whenever a fresh session is inevitable (a first launch, or a relaunch after
+    /// `sessionTimeout`), so `install` and everything recorded before the first foreground
+    /// carry the same id the `session.start` adopts; a resumable session keeps its restored id,
+    /// and later in-process sessions mint theirs at each `session.start`. nil only for events
+    /// replayed from a queue persisted by an SDK build that predates pre-minting.
     let session_id: String?
     let app_id: String
     let user_id: String

@@ -51,8 +51,15 @@ actor Client {
     private var lastActiveAt: Date?
     private var lastHeartbeatAt: Date?
     private var sessionID: String?
+    /// True while `sessionID` is pre-minted and no `session.start` has been sent for it: the id
+    /// exists so `install` and everything else recorded before the first foreground carry the
+    /// session they belong to, and the first non-resume `setActive(true)` must adopt it rather
+    /// than mint another. Mirrored on disk so a process that dies before its first foreground
+    /// hands the id to the next launch instead of leaving the server session it opened orphaned.
+    private var sessionUnadopted = false
     private let lastActiveKey: String
     private let sessionKey: String
+    private let sessionUnadoptedKey: String
 
     // User properties. The last snapshot the server has is mirrored here, so `identify` with the
     // same values on every launch sends nothing; only a change costs an event.
@@ -78,12 +85,44 @@ actor Client {
         // On-disk keys are part of the SDK's contract with existing installs; see CONTRIBUTING.
         self.lastActiveKey = "app.appglance.lastActive.\(config.appID)"
         self.sessionKey = "app.appglance.session.\(config.appID)"
+        self.sessionUnadoptedKey = "app.appglance.sessionUnadopted.\(config.appID)"
         self.traitsKey = "app.appglance.traits.\(config.appID)"
-        if let stamp = UserDefaults.standard.object(forKey: lastActiveKey) as? Double {
-            self.lastActiveAt = Date(timeIntervalSince1970: stamp)
-            self.sessionID = UserDefaults.standard.string(forKey: sessionKey)
+        let defaults = UserDefaults.standard
+        let persistedSessionID = defaults.string(forKey: sessionKey)
+        var restoredLastActive: Date?
+        if let stamp = defaults.object(forKey: lastActiveKey) as? Double {
+            restoredLastActive = Date(timeIntervalSince1970: stamp)
         }
-        self.traits = (UserDefaults.standard.dictionary(forKey: traitsKey) as? [String: String]) ?? [:]
+        self.traits = (defaults.dictionary(forKey: traitsKey) as? [String: String]) ?? [:]
+
+        // A fresh session is inevitable when there is nothing to resume: no earlier run, a gap
+        // already past the timeout, or no session id left behind. Its id is minted here, before
+        // any event exists, so `install` and everything recorded before the first foreground
+        // carry the id that `session.start` will adopt; on the server they all fold into one
+        // session. Persisted immediately, marked unadopted, and the last-active stamp is left
+        // alone: the stamp keeps deciding resume vs new session exactly as it always has.
+        var gapExceedsTimeout = true
+        if let last = restoredLastActive, now().timeIntervalSince(last) <= config.sessionTimeout {
+            gapExceedsTimeout = false
+        }
+        var startupSessionID: String?
+        if restoredLastActive != nil { startupSessionID = persistedSessionID }
+        var startupUnadopted = false
+        if defaults.bool(forKey: sessionUnadoptedKey), let preMinted = persistedSessionID, !preMinted.isEmpty {
+            // A run that died between minting and its first foreground: the same id is still
+            // owed its `session.start`, so it is reused, never replaced.
+            startupSessionID = preMinted
+            startupUnadopted = true
+        } else if gapExceedsTimeout || startupSessionID == nil {
+            let minted = UUID().uuidString.lowercased()
+            startupSessionID = minted
+            startupUnadopted = true
+            defaults.set(minted, forKey: sessionKey)
+            defaults.set(true, forKey: sessionUnadoptedKey)
+        }
+        self.lastActiveAt = restoredLastActive
+        self.sessionID = startupSessionID
+        self.sessionUnadopted = startupUnadopted
 
         // Both backends take the same JSON array of events; they differ in where it goes and how it
         // authenticates. Both ignore a replayed `(app_id, event_id)` - the hosted ingest by design,
@@ -330,10 +369,25 @@ actor Client {
         isActive = active
         let t = at ?? now()
         if active {
+            // The gap is judged now, not at init: it can have crossed the timeout since. A
+            // pre-minted id is never a resume candidate - nothing has opened its session yet.
             let resumes =
-                lastActiveAt.map { sessionID != nil && t.timeIntervalSince($0) <= config.sessionTimeout } ?? false
+                lastActiveAt.map {
+                    sessionID != nil && !sessionUnadopted && t.timeIntervalSince($0) <= config.sessionTimeout
+                } ?? false
             if !resumes {
-                sessionID = UUID().uuidString.lowercased()
+                if sessionUnadopted {
+                    // Adopt the pre-minted id, exactly once: `install` and everything recorded
+                    // before this foreground already carry it, and this `session.start` is the
+                    // one that completes that session. Later sessions in this process mint
+                    // their own ids below. The marker clears before the event is queued, so a
+                    // death in between re-mints rather than re-adopting an id whose
+                    // `session.start` is already in the persisted queue.
+                    sessionUnadopted = false
+                    UserDefaults.standard.removeObject(forKey: sessionUnadoptedKey)
+                } else {
+                    sessionID = UUID().uuidString.lowercased()
+                }
                 track(signal: Signal.sessionStart, metadata: nil, at: t)
             }
             rememberActive(t)
@@ -607,13 +661,18 @@ actor Client {
     /// The user properties as the SDK believes the server has them.
     func currentTraits() -> [String: String] { traits }
 
-    /// The current session id (nil until the first `session.start`).
+    /// The current session id. Non-nil from init on: pre-minted whenever a fresh session is
+    /// inevitable, restored when one can be resumed.
     func currentSessionID() -> String? { sessionID }
+
+    /// Whether the current session id is a pre-minted one still waiting for its `session.start`.
+    func currentSessionIsUnadopted() -> Bool { sessionUnadopted }
 
     /// Forgets the persisted session state and user properties for an app id.
     nonisolated static func resetSessionState(appID: String) {
         UserDefaults.standard.removeObject(forKey: "app.appglance.lastActive.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.session.\(appID)")
+        UserDefaults.standard.removeObject(forKey: "app.appglance.sessionUnadopted.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.traits.\(appID)")
     }
 }
