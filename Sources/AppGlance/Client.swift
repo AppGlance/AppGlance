@@ -11,8 +11,8 @@ actor Client {
     private let headers: [String: String]
     private let storeURL: URL
     private let encoder: JSONEncoder
-    private let environment: AppEnvironment
-    private let collecting: Bool
+    private var environment: AppEnvironment
+    private var collecting: Bool
     private let now: @Sendable () -> Date
 
     /// Hard cap on the queue, so repeated failures cannot grow it without bound. Oldest first.
@@ -30,6 +30,8 @@ actor Client {
     private var inFlight: Task<Void, Never>?
     private var flushTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
+    /// The one-shot environment correction; the first flush waits for it. See `adoptEnvironment`.
+    private var refineTask: Task<Void, Never>?
     /// Set by `shutdown()` once a later `configure` has replaced this client.
     private var retired = false
 
@@ -117,6 +119,7 @@ actor Client {
     deinit {
         heartbeatTask?.cancel()
         flushTask?.cancel()
+        refineTask?.cancel()
     }
 
     /// One console line per `configure`, in two situations only: debug mode is on (say what this
@@ -177,7 +180,45 @@ actor Client {
         heartbeatTask = nil
         flushTask?.cancel()
         flushTask = nil
+        refineTask?.cancel()
+        refineTask = nil
         queue.removeAll()
+    }
+
+    /// Starts the one-shot environment correction; the facade calls this right after
+    /// `configure`. Separate from init so tests own exactly when (and whether) it runs.
+    func beginEnvironmentRefinement() {
+        guard refineTask == nil, !retired else { return }
+        refineTask = Task { [weak self] in
+            let refined = await AppEnvironment.refined()
+            await self?.adoptEnvironment(refined)
+        }
+    }
+
+    /// Adopts the store's answer for where this build runs. Queued events carrying this run's
+    /// guessed label are restamped - the first flush waits for the refinement, so nothing
+    /// leaves with the wrong tag. Labels that differ from the guess are kept: they came from
+    /// an earlier run whose channel this process cannot vouch for. If the corrected
+    /// environment closes the sending gate, the queue is dropped - those events belong to an
+    /// environment the app said should never send.
+    func adoptEnvironment(_ refined: AppEnvironment) {
+        guard !retired, refined != environment else { return }
+        let guessed = environment.rawValue
+        environment = refined
+        let wasCollecting = collecting
+        collecting = config.isEnabled && (config.debug || config.enabledEnvironments.contains(refined))
+        queue = queue.map { $0.environment == guessed ? $0.relabeled(environment: refined.rawValue) : $0 }
+        if !collecting { queue.removeAll() }
+        persist()
+        if wasCollecting != collecting {
+            // The announce line at configure spoke for the guess; say so when the answer differs.
+            Log.line(
+                collecting
+                    ? "environment corrected to \(refined.rawValue) - this build sends after all"
+                    : "environment corrected to \(refined.rawValue) - not sending: enabledEnvironments doesn't include \(refined.caseName)")
+        } else {
+            log("environment corrected: \(guessed) is really \(refined.rawValue)")
+        }
     }
 
     /// `at` is when the app made the call - the facade stamps it before queueing - so events
@@ -353,6 +394,9 @@ actor Client {
     func flush() async {
         flushTask?.cancel()
         flushTask = nil
+        // The store answers the environment question milliseconds after configure; waiting for
+        // it here means no batch ever leaves with the guessed label.
+        if let refineTask { await refineTask.value }
         // The actor suspends inside `drain()`, so a second flush can arrive mid-send. It joins
         // the send in progress instead of racing it - the slice was claimed out of the queue
         // before the await, so nothing is ever sent twice, and a caller holding the process open

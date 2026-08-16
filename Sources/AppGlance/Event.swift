@@ -19,6 +19,14 @@ struct Event: Codable, Sendable {
     let country: String?
     let client_ts: Date
     let metadata: [String: String]?
+
+    /// The same event under a corrected environment label (see `Client.adoptEnvironment`).
+    func relabeled(environment: String) -> Event {
+        Event(
+            event_id: event_id, session_id: session_id, app_id: app_id, user_id: user_id,
+            signal: signal, app_version: app_version, os_name: os_name, os_version: os_version,
+            environment: environment, country: country, client_ts: client_ts, metadata: metadata)
+    }
 }
 
 /// The one JSON dialect the SDK speaks, on the wire and on disk. Timestamps are ISO-8601 UTC

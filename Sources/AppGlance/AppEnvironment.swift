@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import StoreKit
 
 /// Where the app is running. Every event carries it, and it keeps development traffic out of
 /// your numbers: by default only `.appStore` and `.testFlight` builds send (see
@@ -22,6 +23,36 @@ public enum AppEnvironment: String, Sendable, CaseIterable {
         return isTestFlight ? .testFlight : .appStore
         #endif
     }()
+
+    /// `current` corrected against the store's own record.
+    ///
+    /// The receipt heuristic below stopped telling TestFlight and the App Store apart when the
+    /// legacy receipt retired with the iOS 18 SDK: both channels now get a URL ending in plain
+    /// `receipt`, so a TestFlight install reads as App Store. The signed `AppTransaction` names
+    /// the storefront that actually delivered this build. Simulator and Debug are compile-time
+    /// facts and skip the lookup; a build the store cannot vouch for (ad hoc, enterprise, no
+    /// transaction) keeps the heuristic's answer.
+    static func refined() async -> AppEnvironment {
+        #if targetEnvironment(simulator)
+        return current
+        #elseif DEBUG
+        return current
+        #else
+        guard let transaction = try? await AppTransaction.shared.payloadValue else { return current }
+        return refined(from: transaction.environment, fallback: current)
+        #endif
+    }
+
+    /// `.xcode` means a store-signed build launched by the developer tools; `debug` is the
+    /// truthful scope for it - a developer's machine must never appear in Live.
+    static func refined(from store: AppStore.Environment, fallback: AppEnvironment) -> AppEnvironment {
+        switch store {
+        case .sandbox: return .testFlight
+        case .production: return .appStore
+        case .xcode: return .debug
+        default: return fallback
+        }
+    }
 
     private static var isTestFlight: Bool {
         #if os(macOS)

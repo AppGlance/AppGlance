@@ -126,9 +126,10 @@ AppGlance.configure(AppGlance.Configuration(
 
 ### Environments
 
-Every event is tagged `appstore`, `testflight`, `simulator` or `debug`. TestFlight is detected
-at runtime (the sandbox receipt on iOS-family platforms; the beta-distribution signing
-certificate on macOS), and TestFlight events stay out of the dashboard's Live numbers unless you
+Every event is tagged `appstore`, `testflight`, `simulator` or `debug`. TestFlight vs App
+Store is read from the store's signed `AppTransaction` (the sandbox receipt heuristic and, on
+macOS, the beta-distribution signing certificate remain as fallbacks for builds the store
+cannot vouch for), and TestFlight events stay out of the dashboard's Live numbers unless you
 choose to include them. Simulator and Debug builds are excluded by the default
 `enabledEnvironments`; debug mode lifts that gate without changing the tag.
 

@@ -8,6 +8,17 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
 
 ## [Unreleased]
 
+### Fixed
+
+- TestFlight builds are labelled `testflight` again. The legacy receipt heuristic stopped
+  distinguishing TestFlight from the App Store for apps built with the iOS 18 SDK or later
+  (both channels get a receipt URL ending in plain `receipt`), so TestFlight events landed in
+  the App Store scope. The environment is now read from the store's signed `AppTransaction`,
+  with the receipt heuristic kept as the fallback for builds the store cannot vouch for. The
+  answer arrives asynchronously; the first flush waits for it and restamps anything queued, so
+  no event leaves with the wrong label. A store-signed build launched from the developer tools
+  (`AppTransaction.environment == .xcode`) now labels itself `debug` rather than `appstore`.
+
 ## [1.0.0] - 2026-08-16
 
 First public release.

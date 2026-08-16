@@ -196,6 +196,9 @@ public enum AppGlance {
             config: pending.configuration, userID: identity.id,
             isNewInstall: identity.isNew, installAt: pending.at, session: pending.session)
         client = started
+        // TestFlight vs App Store is answered by the store asynchronously; the client's first
+        // flush waits for it, so the answer lands before anything is sent.
+        Task { await started.beginEnvironmentRefinement() }
         return started
     }
 
