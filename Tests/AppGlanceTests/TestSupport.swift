@@ -47,6 +47,7 @@ final class RecordingProtocol: URLProtocol {
     nonisolated(unsafe) private static var batches: [Int] = []  // events per request
     nonisolated(unsafe) private static var sessionIDs: [String?] = []  // per accepted event
     nonisolated(unsafe) private static var statuses: [Int] = []  // scripted answers; 202 once exhausted
+    nonisolated(unsafe) private static var responseHeaders: [String: String]?  // attached to every answer
     nonisolated(unsafe) private static var requests: [URLRequest] = []
     nonisolated(unsafe) private static var received: [[Event]] = []  // every batch, accepted or not
     /// When set, the next request is held open (see `RequestHold`) before it is answered.
@@ -56,6 +57,7 @@ final class RecordingProtocol: URLProtocol {
     static func reset() {
         lock.lock(); defer { lock.unlock() }
         sent = []; batches = []; sessionIDs = []; statuses = []; requests = []; received = []; hold = nil
+        responseHeaders = nil
     }
     static func signals() -> [String] { lock.lock(); defer { lock.unlock() }; return sent }
     static func requestSizes() -> [Int] { lock.lock(); defer { lock.unlock() }; return batches }
@@ -63,6 +65,10 @@ final class RecordingProtocol: URLProtocol {
     static func receivedRequests() -> [URLRequest] { lock.lock(); defer { lock.unlock() }; return requests }
     static func receivedBatches() -> [[Event]] { lock.lock(); defer { lock.unlock() }; return received }
     static func script(_ answers: [Int]) { lock.lock(); statuses = answers; lock.unlock() }
+    /// Headers attached to every response until the next `reset` (e.g. `["Retry-After": "45"]`).
+    static func scriptResponseHeaders(_ headers: [String: String]?) {
+        lock.lock(); responseHeaders = headers; lock.unlock()
+    }
 
     /// Holds the next request open until `proceed()` is called; `isStarted` turns true once it is in flight.
     static func holdNextRequest() -> RequestHold {
@@ -100,6 +106,7 @@ final class RecordingProtocol: URLProtocol {
         let batch = (try? EventCoding.makeDecoder().decode([Event].self, from: body)) ?? []
         Self.lock.lock()
         let status = Self.statuses.isEmpty ? 202 : Self.statuses.removeFirst()
+        let headers = Self.responseHeaders
         if (200..<300).contains(status) {
             Self.sent.append(contentsOf: batch.map(\.signal))
             Self.sessionIDs.append(contentsOf: batch.map(\.session_id))
@@ -109,7 +116,8 @@ final class RecordingProtocol: URLProtocol {
         Self.received.append(batch)
         Self.lock.unlock()
 
-        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+        let response = HTTPURLResponse(
+            url: request.url!, statusCode: status, httpVersion: nil, headerFields: headers)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data("{}".utf8))
         client?.urlProtocolDidFinishLoading(self)
@@ -133,14 +141,14 @@ final class RequestHold: @unchecked Sendable {
 enum TestSupport {
     /// A hosted-mode configuration that only sends on explicit flushes and accepts every environment.
     static func configuration(
-        appID: String, sessionTimeout: TimeInterval = 300,
+        appID: String, sessionTimeout: TimeInterval = 300, maxBatchSize: Int = 1000,
         enabledEnvironments: Set<AppEnvironment> = Set(AppEnvironment.allCases),
         isEnabled: Bool = true, debug: Bool = false
     ) -> AppGlance.Configuration {
         AppGlance.Configuration(
             apiKey: "glance_live_test", appID: appID,
             endpoint: URL(string: "https://ingest.invalid/v1/events")!,
-            flushInterval: 3600, maxBatchSize: 1000, sessionTimeout: sessionTimeout,
+            flushInterval: 3600, maxBatchSize: maxBatchSize, sessionTimeout: sessionTimeout,
             isEnabled: isEnabled, enabledEnvironments: enabledEnvironments, debug: debug)
     }
 

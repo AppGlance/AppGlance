@@ -43,6 +43,15 @@ actor Client {
     /// Set by `shutdown()` once a later `configure` has replaced this client.
     private var retired = false
 
+    // Retry backoff. Automatic delivery (the batch-size trigger, the flush timer) waits
+    // exponentially longer after consecutive retryable failures, so a struggling server is not
+    // hammered once a minute by every install; an explicit `flush()` call is the developer's
+    // own decision and always attempts. Backoff delays attempts, nothing more: what is retried,
+    // and which events a retry may carry, is decided entirely by `drain()`.
+    private var consecutiveFailures = 0
+    private var nextAttemptAt: Date?
+    private let maxBackoff: TimeInterval = 60
+
     // Session state. A session is "the app is in front of the user"; it survives short
     // interruptions and ends only after `sessionTimeout` of absence - the same gap the dashboard
     // uses, so the two agree on what a session is. Persisted so a quit-and-relaunch inside the
@@ -316,7 +325,7 @@ actor Client {
         log("▸ \(signal)\(signal == Signal.heartbeat ? " (presence ping)" : "")" + (metadata.map { " \($0)" } ?? ""))
 
         if queue.count >= config.maxBatchSize {
-            Task { await self.flush() }
+            Task { await self.flushAutomatically() }
         } else {
             scheduleFlush()
         }
@@ -453,15 +462,31 @@ actor Client {
 
     // MARK: - Flushing
 
-    private func scheduleFlush() {
+    private func scheduleFlush(after delay: TimeInterval? = nil) {
         guard flushTask == nil else { return }
-        let interval = config.flushInterval
+        let interval = delay ?? config.flushInterval
         flushTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             // An explicit flush cancels this timer; a cancelled timer must not flush anyway.
             guard !Task.isCancelled else { return }
-            await self?.flush()
+            await self?.flushAutomatically()
         }
+    }
+
+    /// The automatic triggers land here: inside the failure backoff the timer is re-armed for
+    /// the remainder instead of touching the network. `flush()` itself never checks the
+    /// backoff, so an explicit call and the on-the-way-to-background flush always attempt.
+    func flushAutomatically() async {
+        if let nextAttemptAt {
+            let remaining = nextAttemptAt.timeIntervalSince(now())
+            if remaining > 0 {
+                flushTask?.cancel()
+                flushTask = nil
+                scheduleFlush(after: remaining)
+                return
+            }
+        }
+        await flush()
     }
 
     /// `flush()` under a process assertion, so leaving the foreground does not suspend the
@@ -521,8 +546,10 @@ actor Client {
                 try await send(batch)
                 inFlightBatch = []
                 persist()
+                consecutiveFailures = 0
+                nextAttemptAt = nil
                 log("✓ sent \(count)" + (environment == .simulator || environment == .debug ? " (scope: All)" : ""))
-            } catch SendError.status(let status) where status == 413 && batch.count > 1 {
+            } catch SendError.status(let status, _) where status == 413 && batch.count > 1 {
                 // Too big for one request: put it back and go smaller for the rest of this drain.
                 // The server rejected the body without processing any of it, so its heartbeats
                 // were never counted and are safe to re-send.
@@ -530,7 +557,7 @@ actor Client {
                 inFlightBatch = []
                 requeue(batch, keepingHeartbeats: true)
                 slice = max(1, batch.count / 2)
-            } catch SendError.status(let status) where Self.isPermanent(status) {
+            } catch SendError.status(let status, _) where Self.isPermanent(status) {
                 // A 4xx no retry will fix - unknown key, malformed, one oversized event. Dropping
                 // the slice beats a queue that can never drain again.
                 log(
@@ -541,12 +568,17 @@ actor Client {
             } catch {
                 // Offline, 5xx, 429: keep everything, in order, for a later attempt.
                 let why: String
-                if case SendError.status(let status) = error {
+                var retryAfter: TimeInterval?
+                if case SendError.status(let status, let after) = error {
                     why = "HTTP \(status)"
+                    if status == 429 { retryAfter = after }
                 } else {
                     why = error.localizedDescription
                 }
-                log("⟳ couldn't send (\(why)) - keeping \(count) for the next try")
+                consecutiveFailures += 1
+                let delay = backoffDelay(floor: retryAfter)
+                nextAttemptAt = now().addingTimeInterval(delay)
+                log("⟳ couldn't send (\(why)) - keeping \(count) for a try in \(Int(delay.rounded()))s or on flush()")
                 inFlightBatch = []
                 requeue(batch, keepingHeartbeats: !Self.mayHaveBeenApplied(error))
                 return
@@ -605,10 +637,20 @@ actor Client {
         (400..<500).contains(status) && ![408, 425, 429].contains(status)
     }
 
+    /// How long automatic delivery waits after the latest failure: exponential in the number of
+    /// consecutive failures, with jitter so a fleet of installs does not retry in lockstep,
+    /// capped at `maxBackoff`. A server-stated Retry-After is the floor, never shortened.
+    private func backoffDelay(floor retryAfter: TimeInterval?) -> TimeInterval {
+        let exponential = min(maxBackoff, pow(2, Double(consecutiveFailures)))
+        return max(exponential * Double.random(in: 0.5...1), retryAfter ?? 0)
+    }
+
     // MARK: - Networking
 
     private enum SendError: Error {
-        case status(Int)
+        /// The status, and the server's numeric Retry-After in seconds when it sent one. The
+        /// HTTP-date form of the header is rare on rate limits and is ignored.
+        case status(Int, retryAfter: TimeInterval?)
     }
 
     private func send(_ batch: [Event]) async throws {
@@ -620,8 +662,12 @@ actor Client {
         request.httpBody = try encoder.encode(batch)
 
         let (_, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw SendError.status(-1) }
-        guard (200..<300).contains(http.statusCode) else { throw SendError.status(http.statusCode) }
+        guard let http = response as? HTTPURLResponse else { throw SendError.status(-1, retryAfter: nil) }
+        guard (200..<300).contains(http.statusCode) else {
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
+                .flatMap { TimeInterval($0.trimmingCharacters(in: .whitespaces)) }
+            throw SendError.status(http.statusCode, retryAfter: retryAfter)
+        }
     }
 
     // MARK: - Offline persistence
@@ -667,6 +713,12 @@ actor Client {
 
     /// Whether the current session id is a pre-minted one still waiting for its `session.start`.
     func currentSessionIsUnadopted() -> Bool { sessionUnadopted }
+
+    /// The retry backoff as it stands: consecutive failures, and the earliest moment an
+    /// automatic attempt may touch the network (nil when none is scheduled).
+    func backoffForTesting() -> (failures: Int, nextAttemptAt: Date?) {
+        (consecutiveFailures, nextAttemptAt)
+    }
 
     /// Forgets the persisted session state and user properties for an app id.
     nonisolated static func resetSessionState(appID: String) {
