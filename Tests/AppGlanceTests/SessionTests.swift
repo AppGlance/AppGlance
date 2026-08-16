@@ -127,6 +127,47 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(Set(ids.compactMap { $0 }).count, 2, "two sessions were lived")
     }
 
+    /// The last-heartbeat stamp is persisted: the interval is a wall-clock promise that holds
+    /// across a quit-and-relaunch, so presence rollups are not inflated by relaunching.
+    func testHeartbeatTimingSurvivesARelaunch() async throws {
+        let id = "test.session.hbrelaunch"; isolate(id)
+        let clock = TestClock()
+
+        let first = makeClient(appID: id, clock: clock)
+        await first.setActive(true)
+        let ticked = await TestSupport.waitForHeartbeats(1, from: first)
+        XCTAssertTrue(ticked, "the heartbeat task got its turn")
+        clock.advance(30)
+        await first.setActive(false)
+        await first.flush()
+        await first.shutdown()
+
+        // Relaunched inside the heartbeat interval: the persisted stamp says a beat happened 30
+        // seconds ago, so resuming must not tick again at once.
+        let second = makeClient(appID: id, clock: clock)
+        await second.setActive(true)
+        await TestSupport.settle(0.3)
+        let sentEarly = RecordingProtocol.signals().filter { $0 == Signal.heartbeat }.count
+        let queuedEarly = await second.pendingSignals().filter { $0 == Signal.heartbeat }.count
+        XCTAssertEqual(sentEarly + queuedEarly, 1, "a relaunch inside the interval does not beat immediately")
+        await second.setActive(false)
+        await second.flush()
+        await second.shutdown()
+
+        // Relaunched once the interval has genuinely passed (70 seconds since the beat, still
+        // inside the session timeout): the next beat is due at once.
+        clock.advance(40)
+        let third = makeClient(appID: id, clock: clock)
+        await third.setActive(true)
+        let tickedAgain = await TestSupport.waitForHeartbeats(2, from: third)
+        XCTAssertTrue(tickedAgain, "a relaunch past the interval beats at once")
+        await third.setActive(false)
+        await third.flush()
+        XCTAssertEqual(
+            RecordingProtocol.signals().filter { $0 == Signal.sessionStart }.count, 1,
+            "one session throughout; only its first foreground started it")
+    }
+
     // MARK: - Delivery
 
     func testFlushSendsEachEventOnce() async throws {

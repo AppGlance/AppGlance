@@ -69,6 +69,7 @@ actor Client {
     private let lastActiveKey: String
     private let sessionKey: String
     private let sessionUnadoptedKey: String
+    private let lastHeartbeatKey: String
 
     // User properties. The last snapshot the server has is mirrored here, so `identify` with the
     // same values on every launch sends nothing; only a change costs an event.
@@ -95,12 +96,19 @@ actor Client {
         self.lastActiveKey = "app.appglance.lastActive.\(config.appID)"
         self.sessionKey = "app.appglance.session.\(config.appID)"
         self.sessionUnadoptedKey = "app.appglance.sessionUnadopted.\(config.appID)"
+        self.lastHeartbeatKey = "app.appglance.lastHeartbeat.\(config.appID)"
         self.traitsKey = "app.appglance.traits.\(config.appID)"
         let defaults = UserDefaults.standard
         let persistedSessionID = defaults.string(forKey: sessionKey)
         var restoredLastActive: Date?
         if let stamp = defaults.object(forKey: lastActiveKey) as? Double {
             restoredLastActive = Date(timeIntervalSince1970: stamp)
+        }
+        // The heartbeat stamp survives a relaunch for the same reason the session does: the
+        // interval is a wall-clock promise, at most one presence ping per heartbeatInterval,
+        // and the server folds pings into additive rollups that a doubled tick would inflate.
+        if let beat = defaults.object(forKey: lastHeartbeatKey) as? Double {
+            self.lastHeartbeatAt = Date(timeIntervalSince1970: beat)
         }
         self.traits = (defaults.dictionary(forKey: traitsKey) as? [String: String]) ?? [:]
 
@@ -456,6 +464,7 @@ actor Client {
         guard isActive, !Task.isCancelled else { return }
         let t = now()
         lastHeartbeatAt = t
+        UserDefaults.standard.set(t.timeIntervalSince1970, forKey: lastHeartbeatKey)
         rememberActive(t)
         track(signal: Signal.heartbeat, metadata: nil, at: t)
     }
@@ -725,6 +734,7 @@ actor Client {
         UserDefaults.standard.removeObject(forKey: "app.appglance.lastActive.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.session.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.sessionUnadopted.\(appID)")
+        UserDefaults.standard.removeObject(forKey: "app.appglance.lastHeartbeat.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.traits.\(appID)")
     }
 }
