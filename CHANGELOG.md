@@ -8,6 +8,8 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-16
+
 ### Fixed
 
 - TestFlight builds are labelled `testflight` again. The legacy receipt heuristic stopped
