@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- Privacy manifest for the AppGlance SDK.
+
+     What the SDK collects by default, in Apple's vocabulary:
+       - User ID: the random per-install UUID (not the IDFA, not tied to the person), used for
+         analytics only, not linked to identity, never for tracking.
+       - Product Interaction: session starts, presence heartbeats, and the events you track.
+     Country is the device's region setting (a locale, not location data), so no Location data
+     type is declared. The install id lives in the Keychain, which is not a required-reason API.
+     The SDK's own UserDefaults use - the last-active stamp, the current session id, the
+     user-properties snapshot, and a cached copy of the install id - is declared under CA92.1
+     (reading information the app itself wrote).
+
+     Opt-in, declared by your app rather than this manifest: if you call AppGlance.identify with an
+     email, a name, or your own user id, your App Store privacy answers gain Contact Info (Email
+     Address / Name) and Identifiers → User ID as data linked to the user, and the usage data
+     becomes linked too. The dashboard's Setup page lists the exact answers for what you enable. -->
+<dict>
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>CA92.1</string>
+			</array>
+		</dict>
+	</array>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeUserID</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeProductInteraction</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

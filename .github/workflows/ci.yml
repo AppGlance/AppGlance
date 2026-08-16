@@ -1,0 +1,60 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ["*"]
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint (swift-format)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+      - name: swift-format lint
+        run: swift format lint --strict --recursive Sources Tests
+
+  macos:
+    name: Build & test (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+      - name: Swift version
+        run: swift --version
+      - name: Build (release)
+        run: swift build -c release
+      - name: Test
+        run: swift test
+
+  platforms:
+    name: Build (${{ matrix.destination }})
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        destination:
+          - "generic/platform=iOS"
+          - "generic/platform=tvOS"
+          - "generic/platform=watchOS"
+          - "generic/platform=visionOS"
+          - "generic/platform=macOS,variant=Mac Catalyst"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+      - name: Build (release)
+        run: xcodebuild build -quiet -scheme AppGlance -configuration Release -destination "${{ matrix.destination }}"
+
+  ios-simulator:
+    name: Test (iOS Simulator)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+      - name: Test
+        run: xcodebuild test -scheme AppGlance -destination "platform=iOS Simulator,name=iPhone 16" | grep -E "Test (Case|Suite)|error:|TEST (SUCCEEDED|FAILED)|Executed" ; test ${PIPESTATUS[0]} -eq 0
