@@ -46,10 +46,16 @@ public enum AppEnvironment: String, Sendable, CaseIterable {
     /// enterprise build). Callers treat nil as "ask again later", never as an answer, and
     /// `AppTransaction.refresh()` is not an option: it can put a sign-in prompt on screen,
     /// which an analytics SDK must never do.
-    static func storeAnswer() async -> AppEnvironment? {
-        guard !isCompileTimeDetermined else { return nil }
-        guard let transaction = try? await AppTransaction.shared.payloadValue else { return nil }
-        return refined(from: transaction.environment, fallback: current)
+    static func storeAnswer() async -> (answer: AppEnvironment?, failure: String?) {
+        guard !isCompileTimeDetermined else { return (nil, nil) }
+        do {
+            let transaction = try await AppTransaction.shared.payloadValue
+            return (refined(from: transaction.environment, fallback: current), nil)
+        } catch {
+            // The reason travels back for debug-mode narration: a diagnostic TestFlight build
+            // with `debug: true` is the one place this failure can actually be watched.
+            return (nil, String(describing: error))
+        }
     }
 
     /// `.xcode` means a store-signed build launched by the developer tools; `debug` is the

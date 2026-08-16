@@ -203,16 +203,23 @@ actor Client {
             return
         }
         refineTask = Task { [weak self] in
-            let answer = await AppEnvironment.storeAnswer()
-            await self?.adoptStoreAnswer(answer)
+            let (answer, failure) = await AppEnvironment.storeAnswer()
+            await self?.adoptStoreAnswer(answer, failure: failure)
         }
     }
 
     /// nil means the store had no answer this time: the task slot clears so a later flush asks
     /// again, and the guessed label stands meanwhile.
-    func adoptStoreAnswer(_ answer: AppEnvironment?) {
+    func adoptStoreAnswer(_ answer: AppEnvironment?, failure: String? = nil) {
         refineTask = nil
-        guard let answer, !retired, !environmentAnswered else { return }
+        guard !retired else { return }
+        guard let answer else {
+            log(
+                "the store had no environment answer\(failure.map { " (\($0))" } ?? "")"
+                    + " - asking again at the next flush")
+            return
+        }
+        guard !environmentAnswered else { return }
         environmentAnswered = true
         adoptEnvironment(answer)
     }
