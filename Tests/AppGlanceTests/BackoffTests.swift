@@ -101,4 +101,39 @@ final class BackoffTests: XCTestCase {
         let left = await client.pendingSignals()
         XCTAssertEqual(left, ["a"], "rate-limited: the batch is kept for the delayed attempt")
     }
+
+    /// `Retry-After` is a number from the server, and `TimeInterval(_: String)` parses "inf" and
+    /// eleven digits alike. It is obeyed like the presence cadence the server asks for: finite,
+    /// positive, and capped - past a quarter of an hour it is an outage, not rate limiting, and
+    /// an unbounded value would reach the sleep conversion, where it is a crash in the host app.
+    func testAbsurdRetryAfterIsCappedRatherThanObeyed() async throws {
+        let id = "test.backoff.retryafter.absurd"; isolate(id)
+        let clock = TestClock()
+        let client = makeClient(appID: id, clock: clock)
+
+        await client.track(signal: "a", metadata: nil)
+        RecordingProtocol.script([429, 429])
+        RecordingProtocol.scriptResponseHeaders(["Retry-After": "86400"])
+        await client.flush()
+
+        var state = await client.backoffForTesting()
+        var delay = try XCTUnwrap(state.nextAttemptAt).timeIntervalSince(clock.now)
+        XCTAssertEqual(delay, 900, accuracy: 0.5, "a day is not a rate limit: capped at the longest wait obeyed")
+
+        RecordingProtocol.scriptResponseHeaders(["Retry-After": "inf"])
+        await client.flush()
+        state = await client.backoffForTesting()
+        delay = try XCTUnwrap(state.nextAttemptAt).timeIntervalSince(clock.now)
+        XCTAssertLessThanOrEqual(delay, 60, "a value with no meaning is ignored; the exponential wait stands")
+        XCTAssertGreaterThan(delay, 0)
+
+        // The remaining wait is armed as a real timer, so the conversion to nanoseconds happens
+        // for real: it must not trap, and the automatic trigger must still hold its fire.
+        await client.track(signal: "b", metadata: nil)
+        await client.flushAutomatically()
+        await TestSupport.settle(0.1)
+        XCTAssertEqual(RecordingProtocol.requestSizes().count, 2, "inside the backoff, no third attempt")
+        let left = await client.pendingSignals()
+        XCTAssertEqual(left, ["a", "b"], "both kept for the delayed attempt, and the process is still here")
+    }
 }

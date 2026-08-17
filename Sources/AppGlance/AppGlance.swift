@@ -192,13 +192,20 @@ public enum AppGlance {
         if let client { return client }
         guard let pending, let identity = AnonymousIdentity.current(store: pending.store) else { return nil }
         self.pending = nil
+        // `withinBounds()` again, not only in the initializer: `Configuration`'s properties are
+        // `var`s, so an interval assigned after the struct was built would otherwise reach the
+        // client - and its sleeps and its presence loop - unchecked.
         let started = Client(
-            config: pending.configuration, userID: identity.id,
+            config: pending.configuration.withinBounds(), userID: identity.id,
             isNewInstall: identity.isNew, installAt: pending.at, session: pending.session)
         client = started
         // TestFlight vs App Store is answered by the store asynchronously; the client's first
-        // flush waits for it, so the answer lands before anything is sent.
-        Task { await started.beginEnvironmentRefinement() }
+        // flush waits for it, so the answer lands before anything is sent. The lifecycle check
+        // starts here too: it is the absence of a call that it watches for.
+        Task {
+            await started.beginEnvironmentRefinement()
+            await started.armLifecycleCheck()
+        }
         return started
     }
 

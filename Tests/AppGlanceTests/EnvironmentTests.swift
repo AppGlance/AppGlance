@@ -105,6 +105,53 @@ final class EnvironmentTests: XCTestCase {
         XCTAssertEqual(Set(labels), ["testflight"])
     }
 
+    /// A build the store can never answer for - a directly downloaded Mac app, an ad hoc or
+    /// enterprise build - must not spend a task and a storekitd round trip per flush for the
+    /// life of the process. `asksTheStore` is injected because a test host is a Debug build,
+    /// whose environment is a compile-time fact, so the ask path is otherwise never entered.
+    func testTheStoreIsNotAskedForeverWhenItNeverAnswers() async throws {
+        let appID = "env.ceiling"
+        TestSupport.fresh(appID)
+        addTeardownBlock { TestSupport.fresh(appID) }
+        let client = Client(
+            config: TestSupport.configuration(appID: appID), userID: "user-1",
+            session: TestSupport.recordingSession(), asksTheStore: true)
+
+        for _ in 0..<10 {
+            await client.beginEnvironmentRefinement()
+            // The ask resolves to "no answer" at once on this host; let the slot clear, or the
+            // next call would be swallowed by the one-ask-at-a-time guard rather than the ceiling.
+            let deadline = Date().addingTimeInterval(2)
+            while await client.environmentAskIsOpenForTesting(), Date() < deadline {
+                await TestSupport.settle(0.01)
+            }
+        }
+
+        let asks = await client.environmentAsksForTesting()
+        XCTAssertEqual(asks, 5, "a few retries for the fresh install that has nothing cached, then the guess stands")
+    }
+
+    /// The label only matters for events about to leave, so a flush with nothing to send neither
+    /// asks nor waits for an answer.
+    func testAnEmptyFlushDoesNotAskTheStore() async throws {
+        let appID = "env.emptyflush"
+        TestSupport.fresh(appID)
+        addTeardownBlock { TestSupport.fresh(appID) }
+        let client = Client(
+            config: TestSupport.configuration(appID: appID), userID: "user-1",
+            session: TestSupport.recordingSession(), asksTheStore: true)
+
+        await client.flush()
+        var asks = await client.environmentAsksForTesting()
+        XCTAssertEqual(asks, 0, "nothing queued: no ask, and no wait for one")
+
+        await client.track(signal: "a", metadata: nil)
+        await client.flush()
+        asks = await client.environmentAsksForTesting()
+        XCTAssertEqual(asks, 1, "a flush that has something to label does ask")
+        XCTAssertEqual(RecordingProtocol.signals(), ["a"])
+    }
+
     func testAdoptOpensGateForCorrectedEnvironment() async throws {
         let appID = "env.gate.opens"
         TestSupport.fresh(appID)

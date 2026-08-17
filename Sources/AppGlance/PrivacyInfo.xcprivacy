@@ -8,10 +8,11 @@
          analytics only, not linked to identity, never for tracking.
        - Product Interaction: session starts, presence heartbeats, and the events you track.
      Country is the device's region setting (a locale, not location data), so no Location data
-     type is declared. The install id lives in the Keychain, which is not a required-reason API.
-     The SDK's own UserDefaults use - the last-active stamp, the current session id, the
-     user-properties snapshot, and a cached copy of the install id - is declared under CA92.1
-     (reading information the app itself wrote).
+     type is declared. The install id lives in the Keychain, which is not a required-reason API,
+     with a local copy in the app's Caches directory that is excluded from backup so it cannot
+     follow a restore onto another device. The SDK's own UserDefaults use - the last-active
+     stamp, the current session id, the presence stamps and the user-properties snapshot - is
+     declared under CA92.1 (reading information the app itself wrote).
 
      Opt-in, declared by your app rather than this manifest: if you call AppGlance.identify with an
      email, a name, or your own user id, your App Store privacy answers gain Contact Info (Email

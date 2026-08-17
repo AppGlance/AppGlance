@@ -6,6 +6,60 @@ All notable changes to the AppGlance Swift SDK. The format follows
 [GitHub Release](https://github.com/AppGlance/appglance-apple/releases) with the same notes.
 The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-android/blob/main/CHANGELOG.md).
 
+## [Unreleased]
+
+### Fixed
+
+- The install id no longer follows a restore onto a second device. The Keychain item was always
+  `…ThisDeviceOnly`, but the copy kept beside it, as insurance against a momentary Keychain
+  failure, lived in `UserDefaults` - which an iCloud or encrypted backup and a device-to-device
+  transfer both carry. On the new device the Keychain came up empty, the copy answered instead,
+  and the old device's id was adopted and written back, so two handsets in use reported as one
+  install. The copy now lives in a file in the app's Caches directory that is marked excluded
+  from backup, the preferences key it used is cleared when an id is resolved, and the doc comment
+  and the README say what actually happens.
+- Configuration values are clamped instead of trusted. `heartbeatInterval: 0` (a plausible guess
+  for "no presence pings", which is not a thing the SDK offers) turned the presence loop into a
+  spin that pegged a core, rewrote the queue file continuously and POSTed a batch every few
+  milliseconds; `flushInterval: .infinity` or a negative value crashed the app at the first
+  tracked event, on the `UInt64` conversion inside `Task.sleep`. The designated initializer now
+  clamps `flushInterval` to 1-3600, `heartbeatInterval` to 15-3600 (the bounds the SDK already
+  applied to the cadence the server asks for), `sessionTimeout` to 1-86400 and `maxBatchSize` to
+  1-500, falling back to the default for a value that is not finite, and `configure` applies the
+  same bounds to a configuration whose properties were assigned afterwards. Every wait in the
+  client goes through one total conversion, so no reachable value can trap.
+- Turning collection off now discards what was already queued. `isEnabled: false` is how an app
+  honours a consent withdrawal, but the events recorded before the switch was flipped stayed in
+  the on-disk queue: an explicit `AppGlance.flush()` shipped them, and turning the switch back on
+  resurrected them. A client that is not collecting drops the persisted queue and deletes the
+  file at startup, and `flush()` and the sender are gated on the same switch.
+- A server's `Retry-After` is bounded. The header was parsed with no range and no finiteness
+  check, so `Retry-After: 86400` stopped an install sending for a day and `Retry-After: inf`
+  crashed the host app on the next automatic flush. It is now obeyed only as a finite, positive
+  number of seconds, capped at 15 minutes - the same distrust the SDK already showed the
+  server's presence cadence.
+
+### Added
+
+- A missing `.trackAppLifecycle()` is now diagnosable. Sessions, presence and the flush on the
+  way to the background all hang off the lifecycle signal, and nothing in the SDK reports it on
+  its own, so an app that configures the SDK and forgets the modifier sends `install` and its
+  own events - which all look healthy, including in debug mode - while no session ever opens and
+  every event carries one session id that never ends. If no foreground signal has arrived ten
+  seconds after `configure`, the SDK prints one line naming `.trackAppLifecycle()` for SwiftUI
+  and `AppGlance.setActive(_:)` for UIKit. Once, unconditionally, and only when the mistake is
+  actually present.
+
+### Changed
+
+- The environment refinement stops asking. A build the store can never answer for - a Mac app
+  downloaded from a website, an ad hoc or enterprise build, a device where StoreKit is
+  restricted - re-asked on every flush for the life of the process and stalled each flush behind
+  a three-second grace. The store is now asked at most five times (enough for a fresh install
+  with nothing cached, or an offline first launch), only one flush waits out the grace, and a
+  flush with an empty queue neither asks nor waits, since the label only matters for events
+  about to leave.
+
 ## [1.1.0] - 2026-08-17
 
 ### Changed

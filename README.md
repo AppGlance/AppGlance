@@ -56,6 +56,11 @@ front after more than five minutes away, keeps a once-a-minute presence ping run
 in front, and flushes when it leaves. Brief interruptions - a notification, a quick app switch -
 do not start a new session; neither does quitting and relaunching inside the timeout.
 
+It is not optional. Nothing else reports foreground and background, so without it no session
+ever opens, "active right now" stays empty, and every event the install sends belongs to one
+session that never ends. If the SDK is configured and no foreground signal arrives within ten
+seconds, it prints one line to the console saying exactly that.
+
 UIKit apps report the same transitions themselves, from the scene or application delegate:
 
 ```swift
@@ -113,11 +118,11 @@ AppGlance.configure(AppGlance.Configuration(
 
 | Option | Default | Notes |
 |---|---|---|
-| `flushInterval` | `10` s | Wait before sending a partial batch. |
-| `maxBatchSize` | `20` | Send at once when this many events are queued. |
-| `heartbeatInterval` | `60` s | Seconds of silence in the foreground before a presence ping (drives "active now"). A real event resets it; the server may raise it for the account's plan. Never billable. |
-| `sessionTimeout` | `300` s | Away longer than this and coming back is a new session - the dashboard splits on the same gap. |
-| `isEnabled` | `true` | Master off-switch (e.g. behind a user setting). Wins over everything, including `debug`. |
+| `flushInterval` | `10` s | Wait before sending a partial batch. Clamped to 1-3600. |
+| `maxBatchSize` | `20` | Send at once when this many events are queued. Clamped to 1-500, the largest batch the ingest API accepts. |
+| `heartbeatInterval` | `60` s | Seconds of silence in the foreground before a presence ping (drives "active now"). A real event resets it; the server may raise it for the account's plan. Never billable. Clamped to 15-3600: there is no way to switch presence off here. |
+| `sessionTimeout` | `300` s | Away longer than this and coming back is a new session - the dashboard splits on the same gap. Clamped to 1-86400. |
+| `isEnabled` | `true` | Master off-switch (e.g. behind a user setting). Wins over everything, including `debug`. Turning it off also discards whatever an earlier run left queued on disk, so a consent withdrawal covers events already recorded. |
 | `collectsCountry` | `true` | The device's region *setting* as a two-letter code. Not GPS, not IP. |
 | `enabledEnvironments` | `[.appStore, .testFlight]` | Which environments send; Simulator and Debug builds never do by default. |
 | `debug` | `false` | Sends from any environment (tag stays truthful) and logs to the console. |
@@ -177,7 +182,10 @@ so a retried batch is stored once.
 ## Privacy and App Store labels
 
 - **Identity** is a random per-install UUID in the Keychain - not the IDFA, not tied to the
-  person. Reinstalls keep it; "erase all content" or a second device mints a new one.
+  person. Reinstalls keep it; "erase all content" mints a new one. It stays on the device it was
+  minted on: the Keychain item is `…ThisDeviceOnly` and the local copy that backs it up is
+  excluded from backup, so an iCloud restore or a device-to-device transfer does not carry it and
+  the second device mints its own.
 - **Country** is `Locale.current.region` - a settings value, not location data.
 - With the default setup, declare under *Data Not Linked to You*: Identifiers → User ID and
   Usage Data → Product Interaction, purpose Analytics, no tracking. With `identify`, add Contact

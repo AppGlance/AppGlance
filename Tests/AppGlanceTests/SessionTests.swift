@@ -71,6 +71,33 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(queued, [Signal.sessionStart, Signal.heartbeat, "tap", Signal.heartbeat])
     }
 
+    /// Forgetting `.trackAppLifecycle()` is silent from inside the app: `install` and every
+    /// `track` still arrive and still send, but no session ever opens and every event carries the
+    /// one pre-minted session id forever. The SDK says so once, in the build where it happens.
+    func testAMissingLifecycleSignalIsReportedOnceAndASetActiveSilencesIt() async throws {
+        let quiet = "test.session.nolifecycle", wired = "test.session.lifecycle"
+        [quiet, wired].forEach(isolate)
+
+        let unwired = makeClient(appID: quiet, clock: TestClock())
+        await unwired.armLifecycleCheck(after: 0.05)
+        await TestSupport.settle(0.3)
+        var reported = await unwired.reportedMissingLifecycleForTesting()
+        XCTAssertTrue(reported, "configured, sending, and never told the app came to the front: say so")
+
+        // Armed once: a second arming cannot turn it into a stream of lines.
+        await unwired.armLifecycleCheck(after: 0.05)
+        await TestSupport.settle(0.2)
+        reported = await unwired.reportedMissingLifecycleForTesting()
+        XCTAssertTrue(reported)
+
+        let correct = makeClient(appID: wired, clock: TestClock())
+        await correct.armLifecycleCheck(after: 0.2)
+        await correct.setActive(true)
+        await TestSupport.settle(0.4)
+        reported = await correct.reportedMissingLifecycleForTesting()
+        XCTAssertFalse(reported, "the modifier is attached: nothing to report")
+    }
+
     func testBriefInterruptionResumesTheSameSession() async throws {
         let id = "test.session.brief"; isolate(id)
         let clock = TestClock()

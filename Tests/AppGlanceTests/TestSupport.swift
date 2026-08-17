@@ -153,12 +153,18 @@ enum TestSupport {
         enabledEnvironments: Set<AppEnvironment> = Set(AppEnvironment.allCases),
         isEnabled: Bool = true, debug: Bool = false
     ) -> AppGlance.Configuration {
-        AppGlance.Configuration(
+        var config = AppGlance.Configuration(
             apiKey: "glance_live_test", appID: appID,
             endpoint: URL(string: "https://ingest.invalid/v1/events")!,
             flushInterval: 3600, maxBatchSize: maxBatchSize, heartbeatInterval: heartbeatInterval,
             sessionTimeout: sessionTimeout,
             isEnabled: isEnabled, enabledEnvironments: enabledEnvironments, debug: debug)
+        // Assigned after the initializer, on purpose: a shipped app is held to a 15 s presence
+        // floor (and `configure` re-applies it), but a test that drives the presence loop wants
+        // it in milliseconds, so it does not spend the interval waiting in real time. Tests that
+        // pin the bounds themselves live in `ConfigurationTests`.
+        config.heartbeatInterval = heartbeatInterval
+        return config
     }
 
     /// A URLSession that routes every request through `RecordingProtocol`.

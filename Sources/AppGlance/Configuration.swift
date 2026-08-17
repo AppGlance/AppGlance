@@ -42,27 +42,32 @@ extension AppGlance {
         /// Marketing version of the app. Defaults to `CFBundleShortVersionString`.
         public var appVersion: String
 
-        /// Seconds to wait before sending a partial batch. Default 10.
+        /// Seconds to wait before sending a partial batch. Default 10, clamped to 1...3600.
         public var flushInterval: TimeInterval
 
-        /// Send at once when this many events are queued. Default 20.
+        /// Send at once when this many events are queued. Default 20, clamped to 1...500 (the
+        /// largest batch the ingest API accepts).
         public var maxBatchSize: Int
 
         /// How long the app can be in the foreground with nothing sent before a presence ping
         /// goes out. Pings power "active right now" and session length and are never billable;
         /// a real event proves presence just as well, so a ping is only sent after this many
-        /// seconds of silence. Default 60. The server may ask for a sparser cadence for the
-        /// account's plan; the SDK then uses the larger of the two, so this is a floor you can
-        /// raise, not lower. One extra ping goes out when the app leaves the foreground after
-        /// more than a minute of silence, so a session's length is exact whatever the cadence.
+        /// seconds of silence. Default 60, clamped to 15...3600: there is no "off" here, and a
+        /// tighter cadence than 15 s means nothing to the dashboard's five-minute presence
+        /// window. The server may ask for a sparser cadence for the account's plan; the SDK then
+        /// uses the larger of the two, so this is a floor you can raise, not lower. One extra
+        /// ping goes out when the app leaves the foreground after more than a minute of silence,
+        /// so a session's length is exact whatever the cadence.
         public var heartbeatInterval: TimeInterval
 
         /// How long the app can be away - backgrounded, or quit and relaunched - before coming
         /// back starts a new session (`session.start`). Default 300 (five minutes), the same gap
-        /// the dashboard uses to split an install's events into sessions.
+        /// the dashboard uses to split an install's events into sessions. Clamped to 1...86400.
         public var sessionTimeout: TimeInterval
 
-        /// Master switch. `false` records and sends nothing (e.g. behind a user setting). Default true.
+        /// Master switch. `false` records and sends nothing (e.g. behind a user setting). Default
+        /// true. Turning it off also discards whatever an earlier run left queued on disk, so a
+        /// consent withdrawal takes effect for events already recorded and not only for new ones.
         public var isEnabled: Bool
 
         /// Attach the device's region setting (e.g. `"US"`) to events - a locale, never GPS or IP,
@@ -184,14 +189,53 @@ extension AppGlance {
                 appVersion
                 ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
                 ?? "unknown"
-            self.flushInterval = flushInterval
-            self.maxBatchSize = maxBatchSize
-            self.heartbeatInterval = heartbeatInterval
-            self.sessionTimeout = sessionTimeout
+            self.flushInterval = Self.clamped(flushInterval, to: Self.flushIntervalBounds, fallback: 10)
+            self.maxBatchSize = min(
+                max(maxBatchSize, Self.maxBatchSizeBounds.lowerBound), Self.maxBatchSizeBounds.upperBound)
+            self.heartbeatInterval = Self.clamped(
+                heartbeatInterval, to: Self.heartbeatIntervalBounds, fallback: 60)
+            self.sessionTimeout = Self.clamped(sessionTimeout, to: Self.sessionTimeoutBounds, fallback: 300)
             self.isEnabled = isEnabled
             self.collectsCountry = collectsCountry
             self.enabledEnvironments = enabledEnvironments
             self.debug = debug
+        }
+
+        // MARK: - Bounds
+
+        // Every number below reaches arithmetic where an out-of-range value is a crash or a spin
+        // inside somebody else's shipped app, which cannot be hot-fixed: `flushInterval` and the
+        // retry delay become `Task.sleep` durations, whose `UInt64` conversion traps on a
+        // negative, infinite or NaN value; `heartbeatInterval` paces the presence loop, which
+        // sleeps only while the next ping is still in the future, so zero or less makes it tick
+        // (and re-encode the queue file, and POST) as fast as the CPU allows; `maxBatchSize`
+        // decides when a batch is full, so zero or less makes every single event its own request.
+        // Out-of-range values are clamped and a non-finite one falls back to the default rather
+        // than trapping or being rejected: an app that ships a bad number keeps working, with a
+        // cadence it can live with. The presence bounds are the same 15...3600 the SDK already
+        // applies to the cadence the *server* asks for; the Kotlin SDK validates the same fields.
+        private static let flushIntervalBounds: ClosedRange<TimeInterval> = 1...3600
+        private static let heartbeatIntervalBounds: ClosedRange<TimeInterval> = 15...3600
+        private static let sessionTimeoutBounds: ClosedRange<TimeInterval> = 1...86_400
+        private static let maxBatchSizeBounds: ClosedRange<Int> = 1...500
+
+        /// The bounds applied to a whole configuration: the designated initializer run again over
+        /// the values the struct currently holds. `configure` calls this because the properties
+        /// are `var`s, so a value assigned after the initializer ran would otherwise reach the
+        /// same arithmetic unchecked.
+        func withinBounds() -> Configuration {
+            Configuration(
+                backend: backend, appID: appID, appVersion: appVersion, flushInterval: flushInterval,
+                maxBatchSize: maxBatchSize, heartbeatInterval: heartbeatInterval, sessionTimeout: sessionTimeout,
+                isEnabled: isEnabled, collectsCountry: collectsCountry,
+                enabledEnvironments: enabledEnvironments, debug: debug)
+        }
+
+        private static func clamped(
+            _ value: TimeInterval, to bounds: ClosedRange<TimeInterval>, fallback: TimeInterval
+        ) -> TimeInterval {
+            guard value.isFinite else { return fallback }
+            return min(max(value, bounds.lowerBound), bounds.upperBound)
         }
     }
 }

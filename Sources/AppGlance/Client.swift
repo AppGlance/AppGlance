@@ -34,14 +34,42 @@ actor Client {
     /// See `adoptStoreAnswer`.
     private var refineTask: Task<Void, Never>?
     /// True once the store has answered (or the environment is a compile-time fact). Until
-    /// then every flush asks again: a fresh install's first ask can find nothing cached.
+    /// then a flush asks again: a fresh install's first ask can find nothing cached.
     private var environmentAnswered = false
+    /// Asks so far, against the ceiling. Asking again is worth a few tries - a fresh install's
+    /// first ask finds nothing cached, and an offline launch's fails - but some builds can never
+    /// be answered for at all (a directly downloaded Mac app, an ad hoc or enterprise build, a
+    /// device where StoreKit is restricted), and those would otherwise pay a task and a storekitd
+    /// round trip on every flush for as long as the process lives. Once the ceiling is reached
+    /// the guessed label stands for the rest of the run.
+    private var environmentAsks = 0
+    private let maxEnvironmentAsks = 5
     /// How long a flush waits for the store's answer before sending with the guessed label -
     /// a slow or offline first launch must not hold batches hostage; later flushes correct
     /// what follows.
     private let environmentAnswerGrace: TimeInterval = 3
+    /// True once one flush has waited out the grace. Only the first waits: after that the batch
+    /// goes with the guessed label and `adoptEnvironment` restamps whatever is still queued if
+    /// the answer ever arrives, so a build the store never answers for does not pay the wait
+    /// again and again.
+    private var environmentGracePaid = false
     /// Set by `shutdown()` once a later `configure` has replaced this client.
     private var retired = false
+
+    // The missing-lifecycle check. Nothing in the SDK reports foreground and background on its
+    // own: `.trackAppLifecycle()` (SwiftUI) or `AppGlance.setActive(_:)` (UIKit) has to, and
+    // without it `setActive` never runs, so no session ever opens, no presence ping ever fires,
+    // and every event this install ever sends carries the one pre-minted session id. From inside
+    // the app that mistake is invisible - `install` and every `track` still arrive, the flush
+    // timer still sends, and the dashboard's setup badge still turns green - so the SDK says it
+    // out loud once, a little after `configure`, if the signal has not arrived. Unconditional,
+    // like the environment-gate hint in `announce`: it is the one integration mistake a customer
+    // cannot debug from the console, and hiding it behind `debug` hides it from the build where
+    // it happens.
+    private var sawLifecycleSignal = false
+    private var lifecycleCheckTask: Task<Void, Never>?
+    private var lifecycleCheckDone = false
+    private let lifecycleSignalGrace: TimeInterval = 10
 
     // Retry backoff. Automatic delivery (the batch-size trigger, the flush timer) waits
     // exponentially longer after consecutive retryable failures, so a struggling server is not
@@ -96,12 +124,20 @@ actor Client {
     private let installAt: Date
     private var installRecorded = false
 
+    /// Whether this build has anything to ask the store about. A compile-time environment
+    /// (Simulator, Debug) has not, so the question is closed before it is opened. Injected rather
+    /// than read directly so tests can drive the ask path at all: a test host is a Debug build,
+    /// where it is never entered.
+    private let asksTheStore: Bool
+
     init(
         config: AppGlance.Configuration, userID: String, isNewInstall: Bool = false, installAt: Date = Date(),
-        session: URLSession = .shared, now: @escaping @Sendable () -> Date = { Date() }
+        session: URLSession = .shared, now: @escaping @Sendable () -> Date = { Date() },
+        asksTheStore: Bool = !AppEnvironment.isCompileTimeDetermined
     ) {
         self.config = config
         self.session = session
+        self.asksTheStore = asksTheStore
         self.userID = userID
         self.isNewInstall = isNewInstall
         self.installAt = installAt
@@ -187,7 +223,19 @@ actor Client {
         let environment = AppEnvironment.current
         // Debug mode lifts the environment gate and nothing else; the developer's own off-switch wins.
         let collecting = config.isEnabled && (config.debug || config.enabledEnvironments.contains(environment))
-        let persisted = Self.loadPersisted(from: storeURL)
+        // Consent withdrawal applies to what is already on disk, not only to what happens next.
+        // The way an app honours it is to `configure` again with `isEnabled: false`, and the
+        // events recorded before that are exactly the ones consent was withdrawn for: a later
+        // `flush()` must not ship them, and turning the switch back on must not resurrect them.
+        //
+        // The delete is keyed on `isEnabled` alone, NOT on `collecting`. `collecting` also folds
+        // in the environment gate, and that gate closing is not a withdrawal of consent: a
+        // developer building from Xcode over an installed App Store copy closes it for that run,
+        // and deleting the file there would throw away a real queue the store build saved during
+        // an outage. A closed environment gate stops the queue being loaded; only a closed
+        // consent switch destroys it.
+        let persisted = collecting ? Self.loadPersisted(from: storeURL) : []
+        if !config.isEnabled { try? FileManager.default.removeItem(at: storeURL) }
         self.storeURL = storeURL
         self.encoder = EventCoding.makeEncoder()
         self.environment = environment
@@ -203,6 +251,7 @@ actor Client {
         heartbeatTask?.cancel()
         flushTask?.cancel()
         refineTask?.cancel()
+        lifecycleCheckTask?.cancel()
     }
 
     /// One console line per `configure`, in two situations only: debug mode is on (say what this
@@ -265,18 +314,45 @@ actor Client {
         flushTask = nil
         refineTask?.cancel()
         refineTask = nil
+        lifecycleCheckTask?.cancel()
+        lifecycleCheckTask = nil
         queue.removeAll()
+    }
+
+    /// Arms the missing-lifecycle check; the facade calls this once, right after `configure`.
+    /// Separate from init so tests own exactly when (and whether) it runs, and so the delay can
+    /// be shortened in a test rather than waited out.
+    func armLifecycleCheck(after grace: TimeInterval? = nil) {
+        guard collecting, !retired, !sawLifecycleSignal, !lifecycleCheckDone, lifecycleCheckTask == nil else { return }
+        let wait = grace ?? lifecycleSignalGrace
+        lifecycleCheckTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.nanoseconds(wait))
+            guard !Task.isCancelled else { return }
+            await self?.reportMissingLifecycleIfNeeded(after: wait)
+        }
+    }
+
+    private func reportMissingLifecycleIfNeeded(after waited: TimeInterval) {
+        lifecycleCheckTask = nil
+        guard !retired, collecting, !sawLifecycleSignal, !lifecycleCheckDone else { return }
+        lifecycleCheckDone = true
+        Log.line(
+            "no foreground signal \(Int(waited)) s after configure: add .trackAppLifecycle() to your root"
+                + " view (SwiftUI), or call AppGlance.setActive(_:) from your scene or app delegate (UIKit). Without it"
+                + " no session ever opens, \"active right now\" stays empty, and every event this install sends carries"
+                + " one session that never ends, so session counts and lengths are wrong.")
     }
 
     /// Starts (or restarts) the ask for the store's environment answer; the facade calls this
     /// right after `configure`, and `flush()` calls it again while the question is still open.
     /// Separate from init so tests own exactly when (and whether) it runs.
     func beginEnvironmentRefinement() {
-        guard refineTask == nil, !retired, !environmentAnswered else { return }
-        if AppEnvironment.isCompileTimeDetermined {
+        guard refineTask == nil, !retired, !environmentAnswered, environmentAsks < maxEnvironmentAsks else { return }
+        guard asksTheStore else {
             environmentAnswered = true
             return
         }
+        environmentAsks += 1
         refineTask = Task { [weak self] in
             let (answer, failure) = await AppEnvironment.storeAnswer()
             await self?.adoptStoreAnswer(answer, failure: failure)
@@ -284,14 +360,18 @@ actor Client {
     }
 
     /// nil means the store had no answer this time: the task slot clears so a later flush asks
-    /// again, and the guessed label stands meanwhile.
+    /// again, and the guessed label stands meanwhile. Once the ask ceiling is reached the guess
+    /// stands for the rest of the run.
     func adoptStoreAnswer(_ answer: AppEnvironment?, failure: String? = nil) {
         refineTask = nil
         guard !retired else { return }
         guard let answer else {
+            let again = environmentAsks < maxEnvironmentAsks
             log(
                 "the store had no environment answer\(failure.map { " (\($0))" } ?? "")"
-                    + " - asking again at the next flush")
+                    + (again
+                        ? " - asking again at the next flush"
+                        : " - staying with the \(environment.rawValue) guess for this run"))
             return
         }
         guard !environmentAnswered else { return }
@@ -404,6 +484,12 @@ actor Client {
     /// session, whether the app was cold-launched or resumed; inactive stops the heartbeat and
     /// flushes, holding the process open long enough for the send to finish.
     func setActive(_ active: Bool, at: Date? = nil) {
+        // Recorded before the guards: even a call the client has nothing to do with (a repeated
+        // "active", one made while the gate is closed) proves the app is reporting its lifecycle,
+        // which is all the missing-lifecycle check is asking about.
+        sawLifecycleSignal = true
+        lifecycleCheckTask?.cancel()
+        lifecycleCheckTask = nil
         guard collecting, !retired, active != isActive else { return }
         isActive = active
         let t = at ?? now()
@@ -497,7 +583,7 @@ actor Client {
                 guard let self else { return }
                 let wait = await self.timeUntilNextHeartbeat()
                 if wait > 0 {
-                    try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                    try? await Task.sleep(nanoseconds: Self.nanoseconds(wait))
                     continue
                 }
                 guard !Task.isCancelled else { return }
@@ -555,11 +641,21 @@ actor Client {
 
     // MARK: - Flushing
 
+    /// Seconds as a `Task.sleep` duration. Every wait in this file goes through here because the
+    /// bare `UInt64(seconds * 1_000_000_000)` conversion traps on a negative, infinite or NaN
+    /// value, and `try?` does not catch a trap: a crash here is a crash inside the customer's
+    /// shipped app. The inputs are bounded already (the configuration is clamped, a server's
+    /// `Retry-After` is clamped), and this makes the conversion total whatever reaches it.
+    nonisolated private static func nanoseconds(_ seconds: TimeInterval) -> UInt64 {
+        guard seconds.isFinite, seconds > 0 else { return 0 }
+        return UInt64(min(seconds, 3600) * 1_000_000_000)
+    }
+
     private func scheduleFlush(after delay: TimeInterval? = nil) {
         guard flushTask == nil else { return }
         let interval = delay ?? config.flushInterval
         flushTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: Self.nanoseconds(interval))
             // An explicit flush cancels this timer; a cancelled timer must not flush anyway.
             guard !Task.isCancelled else { return }
             await self?.flushAutomatically()
@@ -596,19 +692,6 @@ actor Client {
     func flush() async {
         flushTask?.cancel()
         flushTask = nil
-        // Ask again if the store has not answered yet, then wait briefly: the usual case is an
-        // answer in milliseconds and no batch leaves with the guessed label; the offline first
-        // launch sends with the guess after the grace and is corrected at a later flush.
-        beginEnvironmentRefinement()
-        if let refineTask {
-            let grace = environmentAnswerGrace
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask { await refineTask.value }
-                group.addTask { try? await Task.sleep(nanoseconds: UInt64(grace * 1_000_000_000)) }
-                await group.next()
-                group.cancelAll()
-            }
-        }
         // The actor suspends inside `drain()`, so a second flush can arrive mid-send. It joins
         // the send in progress instead of racing it - the slice was claimed out of the queue
         // before the await, so nothing is ever sent twice, and a caller holding the process open
@@ -616,10 +699,33 @@ actor Client {
         while let running = inFlight {
             await running.value
         }
-        guard !queue.isEmpty, !retired else { return }
+        // Nothing to label, nothing to send: an empty flush (the one after `setActive(false)`
+        // when the previous flush already drained the queue, or an app calling `flush()` on a
+        // hunch) must not pay the wait below for a label no event is waiting on.
+        guard collecting, !queue.isEmpty, !retired else { return }
+        await awaitEnvironmentAnswer()
+        // The answer can close the sending gate, and `adoptEnvironment` then drops the queue.
+        guard collecting, !queue.isEmpty, !retired else { return }
         let sending = Task { await self.drain() }
         inFlight = sending
         await sending.value
+    }
+
+    /// Asks the store where this build runs, if the question is still open, and waits briefly for
+    /// the answer: the usual case is an answer in milliseconds and no batch leaves with the
+    /// guessed label. Only the first flush waits - an offline or unanswerable launch sends with
+    /// the guess after the grace, and a late answer restamps whatever is still queued.
+    private func awaitEnvironmentAnswer() async {
+        beginEnvironmentRefinement()
+        guard let refineTask, !environmentGracePaid else { return }
+        environmentGracePaid = true
+        let grace = environmentAnswerGrace
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await refineTask.value }
+            group.addTask { try? await Task.sleep(nanoseconds: Self.nanoseconds(grace)) }
+            await group.next()
+            group.cancelAll()
+        }
     }
 
     /// Sends the queue in request-sized slices, oldest first, until it is empty or the network
@@ -628,7 +734,7 @@ actor Client {
     private func drain() async {
         defer { inFlight = nil }
         var slice = maxEventsPerRequest
-        while !queue.isEmpty, !retired {
+        while collecting, !queue.isEmpty, !retired {
             let batch = Array(queue.prefix(slice))
             queue.removeFirst(batch.count)
             inFlightBatch = batch
@@ -746,6 +852,21 @@ actor Client {
         case status(Int, retryAfter: TimeInterval?)
     }
 
+    /// The longest wait the SDK will obey from a `Retry-After`. Past this it is not rate limiting
+    /// any more, it is an outage, and the on-disk queue plus the flush on the way to the
+    /// background are the better answer than a foreground stretch that never sends.
+    private static let maxRetryAfter: TimeInterval = 900
+
+    /// A server's `Retry-After` gets the same treatment as the presence cadence the server asks
+    /// for: obeyed only as a finite, positive number of seconds, and clamped. `TimeInterval(_:
+    /// String)` happily parses "inf" and "99999999999" - a header alone must not be able to stop
+    /// an install sending for a day, and the value ends up in a sleep duration where an absurd
+    /// one is a crash inside the host app.
+    nonisolated private static func obeyableRetryAfter(_ seconds: TimeInterval?) -> TimeInterval? {
+        guard let seconds, seconds.isFinite, seconds > 0 else { return nil }
+        return min(seconds, maxRetryAfter)
+    }
+
     private func send(_ batch: [Event]) async throws {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
@@ -757,9 +878,9 @@ actor Client {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw SendError.status(-1, retryAfter: nil) }
         guard (200..<300).contains(http.statusCode) else {
-            let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
+            let stated = http.value(forHTTPHeaderField: "Retry-After")
                 .flatMap { TimeInterval($0.trimmingCharacters(in: .whitespaces)) }
-            throw SendError.status(http.statusCode, retryAfter: retryAfter)
+            throw SendError.status(http.statusCode, retryAfter: Self.obeyableRetryAfter(stated))
         }
         // The hosted ingest answers `{"accepted": n, ...}` and may add `heartbeat_interval`; the
         // Supabase backend answers nothing (return=minimal). Anything unparseable is simply not
@@ -825,6 +946,13 @@ actor Client {
     /// The presence cadence in force: the configured interval or the server's floor, whichever
     /// is larger.
     func heartbeatIntervalForTesting() -> TimeInterval { heartbeatInterval }
+
+    /// Whether the missing-lifecycle line has been printed for this client.
+    func reportedMissingLifecycleForTesting() -> Bool { lifecycleCheckDone }
+
+    /// How many times the store has been asked where this build runs, and whether an ask is open.
+    func environmentAsksForTesting() -> Int { environmentAsks }
+    func environmentAskIsOpenForTesting() -> Bool { refineTask != nil }
 
     /// The retry backoff as it stands: consecutive failures, and the earliest moment an
     /// automatic attempt may touch the network (nil when none is scheduled).
