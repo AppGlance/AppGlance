@@ -80,13 +80,14 @@ final class FacadeTests: XCTestCase {
         AppGlance.setActive(false)  // a banner pulled down…
         AppGlance.setActive(true)  // …and dismissed, all within a moment
         let client = try await liveClient()
-        let ticked1 = await TestSupport.waitForHeartbeats(1, from: client)
-        XCTAssertTrue(ticked1, "the heartbeat task got its turn")
+        await TestSupport.settle(0.3)
         await client.flush()  // the moment away flushed too; wait for every send to land
 
         let signals = RecordingProtocol.signals() + (await client.pendingSignals())
         XCTAssertEqual(signals.filter { $0 == Signal.sessionStart }.count, 1, "one visit, one session")
-        XCTAssertEqual(signals.filter { $0 == Signal.heartbeat }.count, 1, "and exactly one heartbeat so far")
+        XCTAssertEqual(
+            signals.filter { $0 == Signal.heartbeat }.count, 0,
+            "and no heartbeat: session.start proved presence and nothing has been quiet for a minute")
     }
 
     func testFlushBeforeConfigureIsHarmless() async throws {

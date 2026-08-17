@@ -59,6 +59,20 @@ actor Client {
     private var isActive = false
     private var lastActiveAt: Date?
     private var lastHeartbeatAt: Date?
+    /// When this process last recorded a real (non-heartbeat) event. A real event proves
+    /// presence exactly as a ping does - the server moves the same "last seen" stamps for
+    /// both - so the heartbeat waits for `heartbeatInterval` of *silence*, measured from the
+    /// later of this and `lastHeartbeatAt`. Memory only: a relaunch either resumes (the
+    /// persisted ping stamp still paces it) or starts a session, which is itself an event.
+    private var lastEventAt: Date?
+    /// The server's floor for the presence cadence, from the ingest response
+    /// (`heartbeat_interval`, seconds). Plans differ in how often they need to hear from an
+    /// install; the effective interval is the larger of this and the configured one. Persisted,
+    /// so a launch paces itself correctly before its first response arrives.
+    private var serverHeartbeatFloor: TimeInterval?
+    /// A background transition sends one last ping if the server has heard nothing for this
+    /// long, so the session's length is exact however sparse the cadence is.
+    private let closingTickAfter: TimeInterval = 60
     private var sessionID: String?
     /// True while `sessionID` is pre-minted and no `session.start` has been sent for it: the id
     /// exists so `install` and everything else recorded before the first foreground carry the
@@ -70,6 +84,7 @@ actor Client {
     private let sessionKey: String
     private let sessionUnadoptedKey: String
     private let lastHeartbeatKey: String
+    private let heartbeatFloorKey: String
 
     // User properties. The last snapshot the server has is mirrored here, so `identify` with the
     // same values on every launch sends nothing; only a change costs an event.
@@ -97,8 +112,12 @@ actor Client {
         self.sessionKey = "app.appglance.session.\(config.appID)"
         self.sessionUnadoptedKey = "app.appglance.sessionUnadopted.\(config.appID)"
         self.lastHeartbeatKey = "app.appglance.lastHeartbeat.\(config.appID)"
+        self.heartbeatFloorKey = "app.appglance.heartbeatFloor.\(config.appID)"
         self.traitsKey = "app.appglance.traits.\(config.appID)"
         let defaults = UserDefaults.standard
+        if let floor = defaults.object(forKey: heartbeatFloorKey) as? Double, Self.isSaneHeartbeatFloor(floor) {
+            self.serverHeartbeatFloor = floor
+        }
         let persistedSessionID = defaults.string(forKey: sessionKey)
         var restoredLastActive: Date?
         if let stamp = defaults.object(forKey: lastActiveKey) as? Double {
@@ -330,6 +349,9 @@ actor Client {
         // Written now, not only after a failed send: a crash or a kill must not take the
         // session's events with it. A few KB, at most once a minute in steady state.
         persist()
+        // A real event is presence: the next ping is due only after an interval of silence
+        // from here. (Ping stamps are kept separately, in `heartbeat()`, and persisted.)
+        if signal != Signal.heartbeat { lastEventAt = event.client_ts }
         log("▸ \(signal)\(signal == Signal.heartbeat ? " (presence ping)" : "")" + (metadata.map { " \($0)" } ?? ""))
 
         if queue.count >= config.maxBatchSize {
@@ -412,6 +434,16 @@ actor Client {
         } else {
             heartbeatTask?.cancel()
             heartbeatTask = nil
+            // The closing tick. If the server has heard nothing from this install for a while,
+            // one last ping goes out with the flush that follows, so the session's length on
+            // the dashboard ends where the visit actually ended rather than at the last thing
+            // that happened to be sent. Free at a one-minute cadence (the stamp is never that
+            // old); one extra ping per silent visit at the sparser cadences a plan may ask for.
+            if t.timeIntervalSince(lastPresenceAt ?? .distantPast) > closingTickAfter {
+                stampHeartbeat(t)
+                track(signal: Signal.heartbeat, metadata: nil, at: t)
+                log("· closing presence ping (quiet for over a minute)")
+            }
             rememberActive(t)
             Task { await self.flushHoldingProcess() }
         }
@@ -436,37 +468,89 @@ actor Client {
 
     // MARK: - Heartbeat
 
+    /// The presence cadence: a ping goes out only after this long with nothing else sent. The
+    /// larger of what the app configured and what the server asked for.
+    var heartbeatInterval: TimeInterval {
+        max(config.heartbeatInterval, serverHeartbeatFloor ?? 0)
+    }
+
+    /// The last moment the server has (or will have, once the queue flushes) proof that this
+    /// install was in front of someone: the later of the last ping and the last real event.
+    private var lastPresenceAt: Date? {
+        switch (lastHeartbeatAt, lastEventAt) {
+        case (let a?, let b?): return max(a, b)
+        case (let a?, nil): return a
+        case (nil, let b?): return b
+        case (nil, nil): return nil
+        }
+    }
+
+    /// One task per foreground stretch. It never sleeps blindly for an interval: it sleeps
+    /// until the next ping is due, then looks again, because in the meantime a real event may
+    /// have proved presence (pushing the due moment out) or the server may have asked for a
+    /// sparser cadence. Only when the install has been silent for a whole interval does it
+    /// tick.
     private func startHeartbeat() {
         heartbeatTask?.cancel()
-        let interval = config.heartbeatInterval
         heartbeatTask = Task { [weak self] in
             while !Task.isCancelled {
-                // Back from a brief interruption: finish the interval that was running rather
-                // than tick again straight away.
-                if let wait = await self?.timeUntilNextHeartbeat(), wait > 0 {
+                guard let self else { return }
+                let wait = await self.timeUntilNextHeartbeat()
+                if wait > 0 {
                     try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                    continue
                 }
                 guard !Task.isCancelled else { return }
-                await self?.heartbeat()
-                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                // A tick that finds the app no longer active is a stale wake-up; the task that
+                // owns the new stretch (if any) will do its own ticking.
+                guard await self.heartbeat() else { return }
             }
         }
     }
 
+    /// Seconds until the next ping is due: a full interval of silence after the last proof of
+    /// presence. Zero (or negative) means now - including the case where nothing has been sent
+    /// yet, such as a resumed session that started before this process.
     private func timeUntilNextHeartbeat() -> TimeInterval {
-        guard let last = lastHeartbeatAt else { return 0 }
-        return config.heartbeatInterval - now().timeIntervalSince(last)
+        guard let last = lastPresenceAt else { return 0 }
+        return heartbeatInterval - now().timeIntervalSince(last)
     }
 
-    private func heartbeat() {
-        // `setActive(false)` cancels the heartbeat task on the actor; a tick that was already
-        // waiting for its turn must not land after it.
-        guard isActive, !Task.isCancelled else { return }
+    /// Records a ping now. Returns false without ticking when the app is no longer active
+    /// (`setActive(false)` cancels the heartbeat task on the actor; a tick that was already
+    /// waiting for its turn must not land after it).
+    @discardableResult
+    private func heartbeat() -> Bool {
+        guard isActive, !Task.isCancelled else { return false }
         let t = now()
-        lastHeartbeatAt = t
-        UserDefaults.standard.set(t.timeIntervalSince1970, forKey: lastHeartbeatKey)
+        stampHeartbeat(t)
         rememberActive(t)
         track(signal: Signal.heartbeat, metadata: nil, at: t)
+        return true
+    }
+
+    /// The ping stamp is a wall-clock promise (at most one ping per interval, across relaunches),
+    /// so it is persisted the moment it moves.
+    private func stampHeartbeat(_ t: Date) {
+        lastHeartbeatAt = t
+        UserDefaults.standard.set(t.timeIntervalSince1970, forKey: lastHeartbeatKey)
+    }
+
+    /// The server's answer to a batch may carry `heartbeat_interval` (seconds): the sparsest
+    /// presence cadence the account's plan needs. It is a floor, never a ceiling - an app that
+    /// configured a longer interval keeps it - and it is remembered across launches. Out-of-range
+    /// values are ignored rather than obeyed: 15 s is the tightest cadence that has any meaning
+    /// to the dashboard's 5-minute presence window, and past an hour a "presence" ping is not one.
+    private func adoptHeartbeatFloor(_ seconds: TimeInterval?) {
+        guard let seconds, Self.isSaneHeartbeatFloor(seconds) else { return }
+        guard seconds != serverHeartbeatFloor else { return }
+        serverHeartbeatFloor = seconds
+        UserDefaults.standard.set(seconds, forKey: heartbeatFloorKey)
+        log("· presence pings at most every \(Int(heartbeatInterval)) s (the server asked for \(Int(seconds)) s)")
+    }
+
+    nonisolated private static func isSaneHeartbeatFloor(_ seconds: TimeInterval) -> Bool {
+        seconds.isFinite && seconds >= 15 && seconds <= 3600
     }
 
     // MARK: - Flushing
@@ -670,13 +754,28 @@ actor Client {
         }
         request.httpBody = try encoder.encode(batch)
 
-        let (_, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw SendError.status(-1, retryAfter: nil) }
         guard (200..<300).contains(http.statusCode) else {
             let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
                 .flatMap { TimeInterval($0.trimmingCharacters(in: .whitespaces)) }
             throw SendError.status(http.statusCode, retryAfter: retryAfter)
         }
+        // The hosted ingest answers `{"accepted": n, ...}` and may add `heartbeat_interval`; the
+        // Supabase backend answers nothing (return=minimal). Anything unparseable is simply not
+        // a hint - the batch was accepted either way.
+        adoptHeartbeatFloor(Self.heartbeatFloor(in: data))
+    }
+
+    /// `heartbeat_interval` from an ingest response body, if it carries one.
+    nonisolated private static func heartbeatFloor(in data: Data) -> TimeInterval? {
+        guard !data.isEmpty,
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let value = object["heartbeat_interval"]
+        else { return nil }
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let string = value as? String { return TimeInterval(string) }
+        return nil
     }
 
     // MARK: - Offline persistence
@@ -723,6 +822,10 @@ actor Client {
     /// Whether the current session id is a pre-minted one still waiting for its `session.start`.
     func currentSessionIsUnadopted() -> Bool { sessionUnadopted }
 
+    /// The presence cadence in force: the configured interval or the server's floor, whichever
+    /// is larger.
+    func heartbeatIntervalForTesting() -> TimeInterval { heartbeatInterval }
+
     /// The retry backoff as it stands: consecutive failures, and the earliest moment an
     /// automatic attempt may touch the network (nil when none is scheduled).
     func backoffForTesting() -> (failures: Int, nextAttemptAt: Date?) {
@@ -732,6 +835,7 @@ actor Client {
     /// Forgets the persisted session state and user properties for an app id.
     nonisolated static func resetSessionState(appID: String) {
         UserDefaults.standard.removeObject(forKey: "app.appglance.lastActive.\(appID)")
+        UserDefaults.standard.removeObject(forKey: "app.appglance.heartbeatFloor.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.session.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.sessionUnadopted.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.lastHeartbeat.\(appID)")

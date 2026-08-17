@@ -7,9 +7,12 @@ import XCTest
 /// delivers the queue.
 final class SessionTests: XCTestCase {
 
-    private func makeClient(appID: String, clock: TestClock, sessionTimeout: TimeInterval = 300) -> Client {
+    private func makeClient(
+        appID: String, clock: TestClock, sessionTimeout: TimeInterval = 300, heartbeatInterval: TimeInterval = 60
+    ) -> Client {
         Client(
-            config: TestSupport.configuration(appID: appID, sessionTimeout: sessionTimeout),
+            config: TestSupport.configuration(
+                appID: appID, sessionTimeout: sessionTimeout, heartbeatInterval: heartbeatInterval),
             userID: "u-\(appID)", session: TestSupport.recordingSession(), now: { clock.now })
     }
 
@@ -21,20 +24,51 @@ final class SessionTests: XCTestCase {
 
     // MARK: - Sessions and the heartbeat
 
-    func testLaunchStartsExactlyOneSessionAndOneHeartbeat() async throws {
+    func testLaunchStartsExactlyOneSessionAndNoPingUntilAMinuteOfSilence() async throws {
         let id = "test.session.launch"; isolate(id)
         let client = makeClient(appID: id, clock: TestClock())
 
         // onAppear, then scenePhase → .active: two reports of the same fact.
         await client.setActive(true)
         await client.setActive(true)
-        let ticked1 = await TestSupport.waitForHeartbeats(1, from: client)
-        XCTAssertTrue(ticked1, "the heartbeat task got its turn")
+        await TestSupport.settle(0.3)
 
         let queued = await client.pendingSignals()
         XCTAssertEqual(
-            queued, [Signal.sessionStart, Signal.heartbeat],
-            "one session.start then one heartbeat - never two of either")
+            queued, [Signal.sessionStart],
+            "one session.start and nothing else: the start is presence enough, a ping waits for a minute of silence")
+    }
+
+    /// The heartbeat measures silence, not time: any real event resets it, so an install that is
+    /// sending events never pings, and one that goes quiet pings once per interval of quiet.
+    func testPingsOnlyAfterAnIntervalOfSilence() async throws {
+        let id = "test.session.silence"; isolate(id)
+        let clock = TestClock()
+        // A short interval so the task's real-time waits stay short; the clock still decides
+        // when silence has elapsed.
+        let client = makeClient(appID: id, clock: clock, heartbeatInterval: 0.2)
+
+        await client.setActive(true)  // session.start at t0
+        await TestSupport.settle(0.4)
+        var pings = await client.pendingSignals().filter { $0 == Signal.heartbeat }.count
+        XCTAssertEqual(pings, 0, "the clock has not moved: no silence has elapsed yet")
+
+        clock.advance(0.25)  // a full interval of quiet since session.start
+        let ticked = await TestSupport.waitForHeartbeats(1, from: client)
+        XCTAssertTrue(ticked, "quiet for an interval: one ping")
+
+        clock.advance(0.15)
+        await client.track(signal: "tap", metadata: nil)  // presence proved 0.15 s after the ping
+        clock.advance(0.15)  // 0.30 s since the ping, but only 0.15 s since the event
+        await TestSupport.settle(0.4)
+        pings = await client.pendingSignals().filter { $0 == Signal.heartbeat }.count
+        XCTAssertEqual(pings, 1, "the event reset the silence: no second ping yet")
+
+        clock.advance(0.1)  // 0.25 s since the event
+        let tickedAgain = await TestSupport.waitForHeartbeats(2, from: client)
+        XCTAssertTrue(tickedAgain, "quiet again for an interval after the event: a second ping")
+        let queued = await client.pendingSignals()
+        XCTAssertEqual(queued, [Signal.sessionStart, Signal.heartbeat, "tap", Signal.heartbeat])
     }
 
     func testBriefInterruptionResumesTheSameSession() async throws {
@@ -43,13 +77,12 @@ final class SessionTests: XCTestCase {
         let client = makeClient(appID: id, clock: clock)
 
         await client.setActive(true)
-        let ticked1 = await TestSupport.waitForHeartbeats(1, from: client)
-        XCTAssertTrue(ticked1, "the heartbeat task got its turn")
         clock.advance(20)
         await client.setActive(false)  // .inactive (a notification banner, say)
         await client.setActive(false)  // .background - must not flush or act twice
         clock.advance(30)
-        await client.setActive(true)  // back within the timeout: the next beat is 30 s away
+        await client.setActive(true)  // back within the timeout: the next beat is 10 s away
+        await TestSupport.settle(0.3)
         await client.setActive(false)
         await client.flush()
 
@@ -57,8 +90,8 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(
             sent.filter { $0 == Signal.sessionStart }.count, 1, "50 seconds away is an interruption, not a new session")
         XCTAssertEqual(
-            sent.filter { $0 == Signal.heartbeat }.count, 1,
-            "resuming inside the heartbeat interval must not tick again at once")
+            sent.filter { $0 == Signal.heartbeat }.count, 0,
+            "resuming inside the interval since session.start must not tick, and 20 s of quiet earns no closing ping")
         let left = await client.pendingSignals()
         XCTAssertTrue(left.isEmpty, "a successful flush clears the queue")
     }
@@ -69,20 +102,102 @@ final class SessionTests: XCTestCase {
         let client = makeClient(appID: id, clock: clock)
 
         await client.setActive(true)
-        let ticked1 = await TestSupport.waitForHeartbeats(1, from: client)
-        XCTAssertTrue(ticked1, "the heartbeat task got its turn")
         await client.setActive(false)
         clock.advance(6 * 60)  // longer than the 5-minute session timeout
         await client.setActive(true)
-        let ticked2 = await TestSupport.waitForHeartbeats(2, from: client)
-        XCTAssertTrue(ticked2, "the heartbeat task got its turn")
+        await TestSupport.settle(0.3)
         await client.setActive(false)
         await client.flush()
 
         XCTAssertEqual(
             RecordingProtocol.signals(),
-            [Signal.sessionStart, Signal.heartbeat, Signal.sessionStart, Signal.heartbeat],
-            "each return after the gap is a new session with its own first heartbeat")
+            [Signal.sessionStart, Signal.sessionStart],
+            "each return after the gap is a new session; its start is its first proof of presence")
+    }
+
+    /// Leaving the foreground after more than a minute of silence sends one closing ping, so
+    /// the session's length ends where the visit ended; leaving sooner sends nothing extra.
+    func testLeavingAfterAQuietMinuteSendsAClosingPing() async throws {
+        let id = "test.session.closing"; isolate(id)
+        let clock = TestClock()
+        let client = makeClient(appID: id, clock: clock, heartbeatInterval: 3600)  // no periodic ping in this test
+
+        await client.setActive(true)  // session.start at t0
+        clock.advance(30)
+        await client.setActive(false)  // 30 s of quiet: nothing to add
+        await client.flush()
+        XCTAssertEqual(RecordingProtocol.signals(), [Signal.sessionStart])
+
+        clock.advance(10)
+        await client.setActive(true)  // resumed
+        clock.advance(90)  // a quiet minute and a half
+        await client.setActive(false)
+        await client.flush()
+        XCTAssertEqual(
+            RecordingProtocol.signals(), [Signal.sessionStart, Signal.heartbeat],
+            "quiet for over a minute: the goodbye is one ping, stamped at the moment of leaving")
+
+        clock.advance(10)
+        await client.setActive(true)
+        clock.advance(20)
+        await client.track(signal: "tap", metadata: nil)
+        clock.advance(20)
+        await client.setActive(false)  // 20 s since the tap: the server already knows
+        await client.flush()
+        XCTAssertEqual(
+            RecordingProtocol.signals(), [Signal.sessionStart, Signal.heartbeat, "tap"],
+            "a recent event is presence enough: no closing ping")
+    }
+
+    /// The server may raise the cadence for the account's plan through the ingest response;
+    /// the SDK obeys it as a floor, remembers it across launches, and ignores nonsense.
+    func testServerHeartbeatFloorIsHonouredRememberedAndBounded() async throws {
+        let id = "test.session.floor"; isolate(id)
+        let clock = TestClock()
+
+        let first = makeClient(appID: id, clock: clock)
+        var interval = await first.heartbeatIntervalForTesting()
+        XCTAssertEqual(interval, 60, "the configured interval until the server says otherwise")
+
+        RecordingProtocol.scriptResponseBody(#"{"accepted":1,"rejected":0,"heartbeat_interval":240}"#)
+        await first.track(signal: "a", metadata: nil)
+        await first.flush()
+        interval = await first.heartbeatIntervalForTesting()
+        XCTAssertEqual(interval, 240, "the plan asks for a ping every four minutes at most")
+
+        // Remembered: the next launch paces itself before its first response arrives.
+        let second = makeClient(appID: id, clock: clock)
+        interval = await second.heartbeatIntervalForTesting()
+        XCTAssertEqual(interval, 240)
+
+        // A floor, not a ceiling: an app that configured 300 keeps 300 when the server says 240.
+        let wide = makeClient(appID: id, clock: clock, heartbeatInterval: 300)
+        interval = await wide.heartbeatIntervalForTesting()
+        XCTAssertEqual(interval, 300)
+
+        // Nonsense is ignored: too tight to mean anything, or not a presence cadence at all.
+        RecordingProtocol.scriptResponseBody(#"{"accepted":1,"heartbeat_interval":5}"#)
+        await second.track(signal: "b", metadata: nil)
+        await second.flush()
+        interval = await second.heartbeatIntervalForTesting()
+        XCTAssertEqual(interval, 240, "5 s is below the sane floor: kept the last good value")
+        RecordingProtocol.scriptResponseBody(#"{"accepted":1,"heartbeat_interval":86400}"#)
+        await second.track(signal: "c", metadata: nil)
+        await second.flush()
+        interval = await second.heartbeatIntervalForTesting()
+        XCTAssertEqual(interval, 240, "a day is not a presence cadence: kept the last good value")
+        // And back down when the plan changes.
+        RecordingProtocol.scriptResponseBody(#"{"accepted":1,"heartbeat_interval":60}"#)
+        await second.track(signal: "d", metadata: nil)
+        await second.flush()
+        interval = await second.heartbeatIntervalForTesting()
+        XCTAssertEqual(interval, 60)
+        // A response with no hint changes nothing.
+        RecordingProtocol.scriptResponseBody(#"{"accepted":1}"#)
+        await second.track(signal: "e", metadata: nil)
+        await second.flush()
+        interval = await second.heartbeatIntervalForTesting()
+        XCTAssertEqual(interval, 60)
     }
 
     func testRelaunchWithinTimeoutContinuesTheSessionAcrossProcesses() async throws {
@@ -91,8 +206,6 @@ final class SessionTests: XCTestCase {
 
         let first = makeClient(appID: id, clock: clock)
         await first.setActive(true)
-        let ticked1 = await TestSupport.waitForHeartbeats(1, from: first)
-        XCTAssertTrue(ticked1, "the heartbeat task got its turn")
         await first.track(signal: "paywall.viewed", metadata: nil)
         let sid = await first.currentSessionID()
         XCTAssertNotNil(sid)
@@ -102,8 +215,10 @@ final class SessionTests: XCTestCase {
         clock.advance(60)  // quit and reopened a minute later: same session
         let second = makeClient(appID: id, clock: clock)
         await second.setActive(true)
-        let ticked2 = await TestSupport.waitForHeartbeats(2, from: second)
-        XCTAssertTrue(ticked2, "the heartbeat task got its turn")
+        // A resume sends no session.start, and the last thing the server heard was a minute
+        // ago: the resumed process proves its presence with a ping at once.
+        let ticked = await TestSupport.waitForHeartbeats(1, from: second)
+        XCTAssertTrue(ticked, "a resume after an interval of silence pings at once")
         let sid2 = await second.currentSessionID()
         XCTAssertEqual(sid2, sid, "same session id across a quit-and-relaunch inside the timeout")
         await second.setActive(false)
@@ -112,8 +227,7 @@ final class SessionTests: XCTestCase {
         clock.advance(20 * 60)  // reopened much later: a new session
         let third = makeClient(appID: id, clock: clock)
         await third.setActive(true)
-        let ticked3 = await TestSupport.waitForHeartbeats(3, from: third)
-        XCTAssertTrue(ticked3, "the heartbeat task got its turn")
+        await TestSupport.settle(0.3)
         let sid3 = await third.currentSessionID()
         XCTAssertNotEqual(sid3, sid)
         await third.flush()
@@ -122,6 +236,7 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(
             sent.filter { $0 == Signal.sessionStart }.count, 2,
             "the dashboard splits sessions on a 5-minute gap; the SDK agrees")
+        XCTAssertEqual(sent.filter { $0 == Signal.heartbeat }.count, 1, "the resume's ping, and no other")
         let ids = RecordingProtocol.sessions()
         XCTAssertTrue(ids.allSatisfy { $0 != nil }, "every event carries its session id")
         XCTAssertEqual(Set(ids.compactMap { $0 }).count, 2, "two sessions were lived")
@@ -134,7 +249,8 @@ final class SessionTests: XCTestCase {
         let clock = TestClock()
 
         let first = makeClient(appID: id, clock: clock)
-        await first.setActive(true)
+        await first.setActive(true)  // session.start at t0
+        clock.advance(61)  // a quiet minute: the periodic ping is due
         let ticked = await TestSupport.waitForHeartbeats(1, from: first)
         XCTAssertTrue(ticked, "the heartbeat task got its turn")
         clock.advance(30)

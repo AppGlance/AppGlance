@@ -48,8 +48,13 @@ extension AppGlance {
         /// Send at once when this many events are queued. Default 20.
         public var maxBatchSize: Int
 
-        /// Seconds between presence pings while the app is in the foreground. They power
-        /// "active right now" and session length, and are never billable. Default 60.
+        /// How long the app can be in the foreground with nothing sent before a presence ping
+        /// goes out. Pings power "active right now" and session length and are never billable;
+        /// a real event proves presence just as well, so a ping is only sent after this many
+        /// seconds of silence. Default 60. The server may ask for a sparser cadence for the
+        /// account's plan; the SDK then uses the larger of the two, so this is a floor you can
+        /// raise, not lower. One extra ping goes out when the app leaves the foreground after
+        /// more than a minute of silence, so a session's length is exact whatever the cadence.
         public var heartbeatInterval: TimeInterval
 
         /// How long the app can be away - backgrounded, or quit and relaunched - before coming
