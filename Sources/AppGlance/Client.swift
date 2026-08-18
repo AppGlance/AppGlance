@@ -165,6 +165,16 @@ actor Client {
         self.heartbeatFloorKey = "app.appglance.heartbeatFloor.\(config.appID)"
         self.traitsKey = "app.appglance.traits.\(config.appID)"
         let defaults = UserDefaults.standard
+        // A minted id means this device is not the one that state was written on. The install id
+        // is device-bound (a `ThisDeviceOnly` Keychain item, mirrored outside the backup), but
+        // everything below it is in `UserDefaults`, which an iCloud or encrypted backup and a
+        // device-to-device transfer all carry - so a restored handset mints its own id and then
+        // reads the old device's session, presence stamps and user properties as its own. The
+        // traits are the lasting half: `identify` only sends a change, so an install whose cache
+        // says the server already has these properties never sends them, and its page in the
+        // dashboard stays empty however often the app calls `identify`. A genuinely new install
+        // has nothing here to clear, so this costs it nothing.
+        if isNewInstall { Self.resetSessionState(appID: config.appID) }
         if let floor = defaults.object(forKey: heartbeatFloorKey) as? Double, Self.isSaneHeartbeatFloor(floor) {
             self.serverHeartbeatFloor = floor
         }

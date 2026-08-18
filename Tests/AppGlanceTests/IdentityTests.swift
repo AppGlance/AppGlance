@@ -53,6 +53,51 @@ final class IdentityTests: XCTestCase {
             "and the copy an older SDK left in preferences, which backups do carry, is cleared")
     }
 
+    /// The id is device-bound - a `ThisDeviceOnly` Keychain item, mirrored outside the backup -
+    /// but the session, the presence stamps and the user properties beside it are in
+    /// `UserDefaults`, which an iCloud or encrypted backup and a device-to-device transfer all
+    /// carry. The restored handset correctly mints its own id; it must not then read the old
+    /// device's state as its own, or it opens no session of its own and never sends the
+    /// properties its install page is waiting for.
+    func testANewInstallIDDoesNotInheritTheStateATransferCarriedOver() async throws {
+        let id = "test.identity.restore"
+        TestSupport.fresh(id)
+        addTeardownBlock { TestSupport.fresh(id) }
+        let session = TestSupport.recordingSession()
+        let clock = TestClock()
+
+        let a = Client(
+            config: TestSupport.configuration(appID: id), userID: "install-A", session: session,
+            now: { clock.now })
+        await a.setActive(true)
+        await a.identify([UserProperty.email: "ada@example.com"])
+        await a.flush()
+        let sessionA = await a.currentSessionID()
+        await a.shutdown()
+
+        // The queue file is not part of this: it lives in Caches, which is not backed up, so it
+        // never arrives on the second device. `UserDefaults` does. The transfer lands and the app
+        // is opened a minute later - inside the session timeout, so the old device's session would
+        // still look resumable.
+        RecordingProtocol.reset()
+        clock.advance(60)
+        let b = Client(
+            config: TestSupport.configuration(appID: id), userID: "install-B", isNewInstall: true,
+            session: session, now: { clock.now })
+        await b.recordInstallIfNeeded()
+        let traits = await b.currentTraits()
+        XCTAssertEqual(traits, [:], "the new install starts with no properties of its own")
+        let sessionB = await b.currentSessionID()
+        XCTAssertNotEqual(sessionB, sessionA, "and does not continue the old device's session")
+
+        await b.setActive(true)
+        await b.identify([UserProperty.email: "ada@example.com"])
+        await b.flush()
+        XCTAssertEqual(
+            RecordingProtocol.signals(), [Signal.install, Signal.sessionStart, Signal.identify],
+            "so its first visit is a session of its own, and its properties reach the server")
+    }
+
     /// The Keychain is unreadable before the first unlock after a reboot - exactly when a
     /// background launch can happen. Minting there would create a phantom second user.
     func testLockedStoreDoesNotMintAnIdentity() throws {

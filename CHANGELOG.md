@@ -8,6 +8,19 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
 
 ## [Unreleased]
 
+### Fixed
+
+- A restored device no longer inherits the install it was restored from. The install id is
+  device-bound - a `…ThisDeviceOnly` Keychain item, mirrored outside the backup - so a second
+  handset correctly mints its own; the session, the presence stamps and the user properties
+  beside it live in `UserDefaults`, which an iCloud or encrypted backup and a device-to-device
+  transfer all carry. The new install read that state as its own. It continued the old device's
+  session when the app was opened within `sessionTimeout` of that device's last use, so its first
+  visit recorded no `session.start`; and, with no time limit at all, it began believing the server
+  already held the old device's user properties, so `identify` with those values sent nothing and
+  the install's page in the dashboard stayed empty however often the app called it. State left by
+  an install that is not this one is now dropped when an id is minted.
+
 ## [1.2.0] - 2026-08-18
 
 ### Fixed
