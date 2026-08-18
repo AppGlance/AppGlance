@@ -311,7 +311,72 @@ final class SessionTests: XCTestCase {
             "one session throughout; only its first foreground started it")
     }
 
+    /// A visit shorter than one interval leaves no ping stamp behind, so the last thing the
+    /// server heard from this install was a real event. Its stamp is persisted too, or the next
+    /// process would prove presence again the moment it came up.
+    func testAShortVisitDoesNotEarnAPingOnTheNextRelaunch() async throws {
+        let id = "test.session.shortvisit"; isolate(id)
+        let clock = TestClock()
+
+        let first = makeClient(appID: id, clock: clock)
+        await first.setActive(true)  // session.start at t0: a real event, and the only one
+        clock.advance(10)
+        await first.setActive(false)  // quiet for ten seconds, so no closing ping either
+        await first.flush()
+        await first.shutdown()
+
+        clock.advance(20)  // reopened at t+30, well inside both the interval and the timeout
+        let second = makeClient(appID: id, clock: clock)
+        await second.setActive(true)
+        await TestSupport.settle(0.3)
+
+        let sent = RecordingProtocol.signals().filter { $0 == Signal.heartbeat }.count
+        let queued = await second.pendingSignals().filter { $0 == Signal.heartbeat }.count
+        XCTAssertEqual(sent + queued, 0, "the event 30 seconds ago is presence; a ping waits for a full interval")
+    }
+
+    /// A ping the server never acknowledged must not pace the next one: the install would be
+    /// silent for two intervals, which at the sparsest cadence a plan asks for is longer than the
+    /// dashboard's presence window.
+    func testADroppedPingDoesNotPaceTheNextOne() async throws {
+        let id = "test.session.droppedping"; isolate(id)
+        let clock = TestClock()
+
+        let first = makeClient(appID: id, clock: clock)
+        await first.setActive(true)  // session.start at t0
+        clock.advance(61)
+        let ticked = await TestSupport.waitForHeartbeats(1, from: first)
+        XCTAssertTrue(ticked, "the ping is due after a quiet minute")
+
+        RecordingProtocol.script([500])
+        await first.flush()  // the ping is dropped rather than risk counting it twice
+        await TestSupport.settle(0.2)
+        XCTAssertEqual(
+            RecordingProtocol.signals().filter { $0 == Signal.heartbeat }.count, 0,
+            "the server never saw that ping")
+        await first.setActive(false)
+        await first.shutdown()
+
+        // t+91: the app is opened again. The server's last proof of presence is still t0.
+        clock.advance(30)
+        RecordingProtocol.script([])
+        let second = makeClient(appID: id, clock: clock)
+        await second.setActive(true)
+        let proved = await TestSupport.waitForHeartbeats(1, from: second)
+        XCTAssertTrue(proved, "presence is owed from the last acknowledged ping, not from the dropped one")
+    }
+
     // MARK: - Delivery
+
+    func testEveryRequestNamesTheSDKAndItsVersion() async throws {
+        let id = "test.session.useragent"; isolate(id)
+        let client = makeClient(appID: id, clock: TestClock())
+        await client.track(signal: "a", metadata: nil)
+        await client.flush()
+
+        let agents = RecordingProtocol.receivedRequests().map { $0.value(forHTTPHeaderField: "User-Agent") }
+        XCTAssertEqual(agents, ["AppGlance-Apple/\(AppGlance.version)"])
+    }
 
     func testFlushSendsEachEventOnce() async throws {
         let id = "test.session.once"; isolate(id)

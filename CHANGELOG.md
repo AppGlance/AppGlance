@@ -8,6 +8,8 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-18
+
 ### Fixed
 
 - The install id no longer follows a restore onto a second device. The Keychain item was always
@@ -38,9 +40,33 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
   crashed the host app on the next automatic flush. It is now obeyed only as a finite, positive
   number of seconds, capped at 15 minutes - the same distrust the SDK already showed the
   server's presence cadence.
+- A relaunch inside the session timeout no longer pings the moment it comes up. The stamp for
+  the last real event was kept in memory only, and a visit shorter than one interval leaves no
+  ping stamp behind either, so a fresh process had no proof of presence of its own however
+  recently the server had heard from that install. It is now persisted beside the ping stamp.
+  Every jetsam-and-reopen inside a visit was costing one extra tick in rollups the server folds
+  additively.
+- A presence ping that is dropped rather than retried no longer spends a whole fresh interval.
+  The stamp that paces the next ping is written when the ping is queued, so a batch answered
+  with a `5xx` or a `429`, or one whose connection died after connecting, left the install
+  silent for two intervals. At the four-minute cadence a free-plan account is asked for, that is
+  longer than the dashboard's five-minute presence window, so an app in the foreground the whole
+  time dropped out of "active right now" for about three minutes. The next ping is now measured
+  from the last ping the server acknowledged.
+- A client the environment gate has closed writes no session state. A developer's Xcode run over
+  an installed App Store copy minted and persisted a session id that its own run could never
+  use, renumbering state the store build owns. A corrected environment that closes the gate now
+  also stops the presence and flush timers, which had nothing left to send; one that opens it
+  mints the session id that client skipped at startup.
 
 ### Added
 
+- `AppGlance.version`, sent as the `User-Agent` of every request (`AppGlance-Apple/1.2.0`), so
+  an install still on an older release can be told from one that has updated.
+- `configure` called from an app extension records nothing and says why. An extension is a
+  separate process with its own container and its own Keychain access group, so it cannot see
+  the app's install id: it would mint a second one, record a second `install`, and report one
+  device as two users with a session each.
 - A missing `.trackAppLifecycle()` is now diagnosable. Sessions, presence and the flush on the
   way to the background all hang off the lifecycle signal, and nothing in the SDK reports it on
   its own, so an app that configures the SDK and forgets the modifier sends `install` and its
@@ -59,6 +85,9 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
   with nothing cached, or an offline first launch), only one flush waits out the grace, and a
   flush with an empty queue neither asks nor waits, since the label only matters for events
   about to leave.
+- The README and the environment documentation describe the store-channel split as it behaves:
+  the tag follows the store's signed `AppTransaction`, a launch starts from the receipt as a
+  guess, and only a build the store cannot vouch for at all keeps that guess.
 
 ## [1.1.0] - 2026-08-17
 
@@ -66,7 +95,7 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
 
 - The presence ping now measures silence, not time. A real event proves the app is in front of
   someone exactly as a ping does (the server moves the same "last seen" and session stamps for
-  both), so a `heartbeat` is sent only after `heartbeatInterval` with nothing else sent — the
+  both), so a `heartbeat` is sent only after `heartbeatInterval` with nothing else sent: the
   tick that used to fire at the start of every session alongside `session.start` is gone, an
   install that keeps sending events never pings, and a quiet one pings once per interval of
   quiet. Nothing on the dashboard changes: "active right now" and session length read the same
@@ -80,10 +109,10 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
 ### Added
 
 - The server may ask for a sparser presence cadence for the account's plan by answering a batch
-  with `heartbeat_interval` (seconds). The SDK obeys it as a floor — the effective interval is
+  with `heartbeat_interval` (seconds). The SDK obeys it as a floor (the effective interval is
   the larger of the configured `heartbeatInterval` and the server's value, so an app that
-  configured a longer interval keeps it — remembers it across launches, and ignores values
-  outside 15 s–1 h. Servers that send nothing (including the Supabase backend) leave the
+  configured a longer interval keeps it), remembers it across launches, and ignores values
+  outside 15 s to 1 h. Servers that send nothing (including the Supabase backend) leave the
   configured interval in force, so this is fully additive on the wire.
 
 ## [1.0.2] - 2026-08-17

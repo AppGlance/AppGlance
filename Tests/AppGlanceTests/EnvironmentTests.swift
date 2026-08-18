@@ -58,6 +58,45 @@ final class EnvironmentTests: XCTestCase {
         XCTAssertEqual(labels, ["appstore", "testflight"], "the foreign label survives; the guessed one is restamped")
     }
 
+    /// A client the gate has closed records nothing, so it must not write session state either:
+    /// a developer's Xcode run over an installed App Store copy would otherwise renumber the
+    /// session the store build is in the middle of.
+    func testAGatedClientWritesNoSessionState() async throws {
+        let appID = "env.gated.state"
+        TestSupport.fresh(appID)
+        let sessionKey = "app.appglance.session.\(appID)"
+        let unadoptedKey = "app.appglance.sessionUnadopted.\(appID)"
+
+        _ = Client(
+            config: TestSupport.configuration(appID: appID, enabledEnvironments: [.appStore]),
+            userID: "user-1", session: TestSupport.recordingSession())
+
+        XCTAssertNil(UserDefaults.standard.string(forKey: sessionKey), "no session id was minted")
+        XCTAssertFalse(UserDefaults.standard.bool(forKey: unadoptedKey), "and nothing is owed a session.start")
+    }
+
+    /// A gate that opens mints the session id its client did not mint at startup, so events
+    /// recorded before the first foreground still carry the one `session.start` will adopt.
+    func testAGateThatOpensMintsTheSessionIDItsClientSkipped() async throws {
+        let appID = "env.gated.opens"
+        TestSupport.fresh(appID)
+        let client = Client(
+            config: TestSupport.configuration(appID: appID, enabledEnvironments: [.appStore]),
+            userID: "user-1", session: TestSupport.recordingSession())
+        var sessionID = await client.currentSessionID()
+        XCTAssertNil(sessionID, "a gated client mints nothing")
+
+        await client.adoptEnvironment(.appStore)
+
+        sessionID = await client.currentSessionID()
+        XCTAssertNotNil(sessionID)
+        let unadopted = await client.currentSessionIsUnadopted()
+        XCTAssertTrue(unadopted, "and it is owed a session.start")
+        await client.track(signal: "paywall.viewed", metadata: nil)
+        let queued = await client.pendingEvents()
+        XCTAssertEqual(queued.map(\.session_id), [sessionID])
+    }
+
     func testAdoptDropsQueueWhenGateCloses() async throws {
         let appID = "env.gate.closes"
         TestSupport.fresh(appID)

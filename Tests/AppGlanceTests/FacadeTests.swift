@@ -29,6 +29,18 @@ final class FacadeTests: XCTestCase {
         return try XCTUnwrap(client, "no live client", file: file, line: line)
     }
 
+    /// An app extension is a separate process with its own container and its own Keychain access
+    /// group, so it cannot share the app's install id: `configure` there records nothing.
+    func testAnAppExtensionBundleIsRecognised() throws {
+        XCTAssertFalse(AppGlance.isAppExtension(.main), "the test host is an app, not an extension")
+
+        let appex = FileManager.default.temporaryDirectory.appendingPathComponent("Probe.appex", isDirectory: true)
+        try? FileManager.default.createDirectory(at: appex, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: appex) }
+        let bundle = try XCTUnwrap(Bundle(url: appex))
+        XCTAssertTrue(AppGlance.isAppExtension(bundle))
+    }
+
     func testCallsApplyInOrderAndInstallIsFirst() async throws {
         let id = "test.facade.order"; await isolate(id)
         configure(id, store: InMemoryIdentityStore())  // a fresh install

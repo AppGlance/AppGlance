@@ -87,11 +87,17 @@ actor Client {
     private var isActive = false
     private var lastActiveAt: Date?
     private var lastHeartbeatAt: Date?
-    /// When this process last recorded a real (non-heartbeat) event. A real event proves
+    /// The newest ping the server has acknowledged: seeded from the persisted stamp, moved only
+    /// by an accepted batch, and what a dropped ping's stamp is rolled back to. See
+    /// `rollBackHeartbeatStamp`.
+    private var deliveredHeartbeatAt: Date?
+    /// When this install last recorded a real (non-heartbeat) event. A real event proves
     /// presence exactly as a ping does - the server moves the same "last seen" stamps for
     /// both - so the heartbeat waits for `heartbeatInterval` of *silence*, measured from the
-    /// later of this and `lastHeartbeatAt`. Memory only: a relaunch either resumes (the
-    /// persisted ping stamp still paces it) or starts a session, which is itself an event.
+    /// later of this and `lastHeartbeatAt`. Persisted for the same reason the ping stamp is: a
+    /// relaunch inside `sessionTimeout` resumes and records no `session.start`, and a visit
+    /// shorter than one interval leaves no ping stamp behind either, so without it a fresh
+    /// process would owe a ping at once however recently the app was really heard from.
     private var lastEventAt: Date?
     /// The server's floor for the presence cadence, from the ingest response
     /// (`heartbeat_interval`, seconds). Plans differ in how often they need to hear from an
@@ -101,6 +107,12 @@ actor Client {
     /// A background transition sends one last ping if the server has heard nothing for this
     /// long, so the session's length is exact however sparse the cadence is.
     private let closingTickAfter: TimeInterval = 60
+    /// The soonest a ping may replace one that was dropped (see `rollBackHeartbeatStamp`). Far
+    /// enough out that a ping which did land after all is not followed by a second tick in the
+    /// same second; short enough that the sparsest cadence a plan asks for (240 s) plus one
+    /// dropped ping still keeps the install inside the dashboard's five-minute presence window.
+    /// It is also the finest presence resolution `heartbeatInterval` itself allows.
+    private let minHeartbeatRetry: TimeInterval = 15
     private var sessionID: String?
     /// True while `sessionID` is pre-minted and no `session.start` has been sent for it: the id
     /// exists so `install` and everything else recorded before the first foreground carry the
@@ -112,6 +124,7 @@ actor Client {
     private let sessionKey: String
     private let sessionUnadoptedKey: String
     private let lastHeartbeatKey: String
+    private let lastEventKey: String
     private let heartbeatFloorKey: String
 
     // User properties. The last snapshot the server has is mirrored here, so `identify` with the
@@ -148,6 +161,7 @@ actor Client {
         self.sessionKey = "app.appglance.session.\(config.appID)"
         self.sessionUnadoptedKey = "app.appglance.sessionUnadopted.\(config.appID)"
         self.lastHeartbeatKey = "app.appglance.lastHeartbeat.\(config.appID)"
+        self.lastEventKey = "app.appglance.lastEvent.\(config.appID)"
         self.heartbeatFloorKey = "app.appglance.heartbeatFloor.\(config.appID)"
         self.traitsKey = "app.appglance.traits.\(config.appID)"
         let defaults = UserDefaults.standard
@@ -165,14 +179,29 @@ actor Client {
         if let beat = defaults.object(forKey: lastHeartbeatKey) as? Double {
             self.lastHeartbeatAt = Date(timeIntervalSince1970: beat)
         }
+        // A ping an earlier process stamped is the best proof of delivery this one can have: the
+        // queue file never holds a ping that was in flight, so there is nothing left to re-send
+        // either way. A roll-back therefore undoes only this process's own unconfirmed pings.
+        self.deliveredHeartbeatAt = self.lastHeartbeatAt
+        // The event stamp comes back with it: it is the other half of the silence the interval
+        // measures, and a resumed session records no event of its own to replace it.
+        if let event = defaults.object(forKey: lastEventKey) as? Double {
+            self.lastEventAt = Date(timeIntervalSince1970: event)
+        }
         self.traits = (defaults.dictionary(forKey: traitsKey) as? [String: String]) ?? [:]
+
+        let environment = AppEnvironment.current
+        // Debug mode lifts the environment gate and nothing else; the developer's own off-switch wins.
+        let collecting = config.isEnabled && (config.debug || config.enabledEnvironments.contains(environment))
 
         // A fresh session is inevitable when there is nothing to resume: no earlier run, a gap
         // already past the timeout, or no session id left behind. Its id is minted here, before
         // any event exists, so `install` and everything recorded before the first foreground
         // carry the id that `session.start` will adopt; on the server they all fold into one
         // session. Persisted immediately, marked unadopted, and the last-active stamp is left
-        // alone: the stamp keeps deciding resume vs new session exactly as it always has.
+        // alone: the stamp keeps deciding resume vs new session exactly as it always has. A
+        // client the gate has closed records nothing, so it mints nothing and writes nothing:
+        // its own run must not renumber the session state a sending build left behind.
         var gapExceedsTimeout = true
         if let last = restoredLastActive, now().timeIntervalSince(last) <= config.sessionTimeout {
             gapExceedsTimeout = false
@@ -180,17 +209,19 @@ actor Client {
         var startupSessionID: String?
         if restoredLastActive != nil { startupSessionID = persistedSessionID }
         var startupUnadopted = false
-        if defaults.bool(forKey: sessionUnadoptedKey), let preMinted = persistedSessionID, !preMinted.isEmpty {
-            // A run that died between minting and its first foreground: the same id is still
-            // owed its `session.start`, so it is reused, never replaced.
-            startupSessionID = preMinted
-            startupUnadopted = true
-        } else if gapExceedsTimeout || startupSessionID == nil {
-            let minted = UUID().uuidString.lowercased()
-            startupSessionID = minted
-            startupUnadopted = true
-            defaults.set(minted, forKey: sessionKey)
-            defaults.set(true, forKey: sessionUnadoptedKey)
+        if collecting {
+            if defaults.bool(forKey: sessionUnadoptedKey), let preMinted = persistedSessionID, !preMinted.isEmpty {
+                // A run that died between minting and its first foreground: the same id is still
+                // owed its `session.start`, so it is reused, never replaced.
+                startupSessionID = preMinted
+                startupUnadopted = true
+            } else if gapExceedsTimeout || startupSessionID == nil {
+                let minted = UUID().uuidString.lowercased()
+                startupSessionID = minted
+                startupUnadopted = true
+                defaults.set(minted, forKey: sessionKey)
+                defaults.set(true, forKey: sessionUnadoptedKey)
+            }
         }
         self.lastActiveAt = restoredLastActive
         self.sessionID = startupSessionID
@@ -205,6 +236,7 @@ actor Client {
             self.headers = [
                 "Content-Type": "application/json",
                 "Authorization": "Bearer \(apiKey)",
+                "User-Agent": Self.userAgent,
             ]
         case .supabase(let url, let publishableKey):
             let table = url.appendingPathComponent("rest/v1/events")
@@ -216,13 +248,11 @@ actor Client {
                 "apikey": publishableKey,
                 "Authorization": "Bearer \(publishableKey)",
                 "Prefer": "return=minimal, resolution=ignore-duplicates",
+                "User-Agent": Self.userAgent,
             ]
         }
 
         let storeURL = Self.makeStoreURL(appID: config.appID)
-        let environment = AppEnvironment.current
-        // Debug mode lifts the environment gate and nothing else; the developer's own off-switch wins.
-        let collecting = config.isEnabled && (config.debug || config.enabledEnvironments.contains(environment))
         // Consent withdrawal applies to what is already on disk, not only to what happens next.
         // The way an app honours it is to `configure` again with `isEnabled: false`, and the
         // events recorded before that are exactly the ones consent was withdrawn for: a later
@@ -391,8 +421,24 @@ actor Client {
         environment = refined
         let wasCollecting = collecting
         collecting = config.isEnabled && (config.debug || config.enabledEnvironments.contains(refined))
+        if !wasCollecting, collecting, sessionID == nil {
+            // The gate was closed when this client started, so it minted no session id then.
+            // Everything recorded from here to the first foreground still needs the id that
+            // `session.start` will adopt.
+            let minted = UUID().uuidString.lowercased()
+            sessionID = minted
+            sessionUnadopted = true
+            UserDefaults.standard.set(minted, forKey: sessionKey)
+            UserDefaults.standard.set(true, forKey: sessionUnadoptedKey)
+        }
         queue = queue.map { $0.environment == guessed ? $0.relabeled(environment: refined.rawValue) : $0 }
-        if !collecting { queue.removeAll() }
+        if !collecting {
+            queue.removeAll()
+            heartbeatTask?.cancel()
+            heartbeatTask = nil
+            flushTask?.cancel()
+            flushTask = nil
+        }
         persist()
         if wasCollecting != collecting {
             // The announce line at configure spoke for the guess; say so when the answer differs.
@@ -430,8 +476,12 @@ actor Client {
         // session's events with it. A few KB, at most once a minute in steady state.
         persist()
         // A real event is presence: the next ping is due only after an interval of silence
-        // from here. (Ping stamps are kept separately, in `heartbeat()`, and persisted.)
-        if signal != Signal.heartbeat { lastEventAt = event.client_ts }
+        // from here. (Ping stamps are kept separately, in `heartbeat()`.) Persisted like the
+        // ping stamp, on the code path that has just written the queue file anyway.
+        if signal != Signal.heartbeat {
+            lastEventAt = event.client_ts
+            UserDefaults.standard.set(event.client_ts.timeIntervalSince1970, forKey: lastEventKey)
+        }
         log("▸ \(signal)\(signal == Signal.heartbeat ? " (presence ping)" : "")" + (metadata.map { " \($0)" } ?? ""))
 
         if queue.count >= config.maxBatchSize {
@@ -575,15 +625,18 @@ actor Client {
     /// until the next ping is due, then looks again, because in the meantime a real event may
     /// have proved presence (pushing the due moment out) or the server may have asked for a
     /// sparser cadence. Only when the install has been silent for a whole interval does it
-    /// tick.
-    private func startHeartbeat() {
+    /// tick. `notBefore` holds the first wait open for at least that long, which is what a ping
+    /// replacing a dropped one is armed with.
+    private func startHeartbeat(notBefore floor: TimeInterval = 0) {
         heartbeatTask?.cancel()
         heartbeatTask = Task { [weak self] in
+            var minimumWait = floor
             while !Task.isCancelled {
                 guard let self else { return }
-                let wait = await self.timeUntilNextHeartbeat()
+                let wait = max(await self.timeUntilNextHeartbeat(), minimumWait)
                 if wait > 0 {
                     try? await Task.sleep(nanoseconds: Self.nanoseconds(wait))
+                    minimumWait = 0  // it applied to the first wait, and that one has been served
                     continue
                 }
                 guard !Task.isCancelled else { return }
@@ -620,6 +673,44 @@ actor Client {
     private func stampHeartbeat(_ t: Date) {
         lastHeartbeatAt = t
         UserDefaults.standard.set(t.timeIntervalSince1970, forKey: lastHeartbeatKey)
+    }
+
+    /// Remembers the newest ping in a batch the server accepted.
+    private func noteDeliveredHeartbeats(_ batch: [Event]) {
+        guard let newest = batch.filter({ $0.signal == Signal.heartbeat }).map(\.client_ts).max() else { return }
+        if newest > (deliveredHeartbeatAt ?? .distantPast) { deliveredHeartbeatAt = newest }
+    }
+
+    /// Undoes the stamp of a ping `requeue` has just dropped, putting it back to the newest ping
+    /// the server acknowledged.
+    ///
+    /// The stamp is written when a ping is *queued*, because it is what paces the timer and a
+    /// ping still on the wire must not earn a second one. But a dropped ping is one the server
+    /// may never have seen, and leaving its stamp in place spends a whole fresh interval before
+    /// the install proves presence again. At 60 s that costs a minute of resolution on a chart
+    /// that is approximate by design; at the four-minute cadence a free-plan account is asked
+    /// for, two intervals back to back are longer than the dashboard's five-minute presence
+    /// window, so an install that is in the foreground the whole time drops out of "active right
+    /// now" for three of them. Re-arming from the last acknowledged ping instead measures the
+    /// silence that is really outstanding, and the replacement never piles up: the next failure
+    /// drops the ping this one queues, so at most one unacknowledged ping is ever in the queue.
+    ///
+    /// The trade is one tick against another. If the dropped ping did land after all - a reply
+    /// lost on the way back - the replacement is a second tick inside one interval, exactly the
+    /// size of error a dropped tick is when it did not land. The answered failures that can
+    /// reach a presence-only batch (a 429, an edge 5xx, a connection dropped after connect) are
+    /// overwhelmingly ones the ingest never applied, and presence is the number the product is
+    /// read for, so proving it again is the right way round. `minHeartbeatRetry` keeps the two
+    /// apart in the case where it was not.
+    private func rollBackHeartbeatStamp(newestDropped: Date) {
+        guard let current = lastHeartbeatAt, current <= newestDropped else { return }
+        lastHeartbeatAt = deliveredHeartbeatAt
+        if let restored = deliveredHeartbeatAt {
+            UserDefaults.standard.set(restored.timeIntervalSince1970, forKey: lastHeartbeatKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: lastHeartbeatKey)
+        }
+        if isActive { startHeartbeat(notBefore: minHeartbeatRetry) }
     }
 
     /// The server's answer to a batch may carry `heartbeat_interval` (seconds): the sparsest
@@ -747,6 +838,7 @@ actor Client {
                 persist()
                 consecutiveFailures = 0
                 nextAttemptAt = nil
+                noteDeliveredHeartbeats(batch)
                 log("✓ sent \(count)" + (environment == .simulator || environment == .debug ? " (scope: All)" : ""))
             } catch SendError.status(let status, _) where status == 413 && batch.count > 1 {
                 // Too big for one request: put it back and go smaller for the rest of this drain.
@@ -799,6 +891,11 @@ actor Client {
             log(
                 "· dropped \(dropped) presence ping\(dropped == 1 ? "" : "s") rather than risk counting \(dropped == 1 ? "it" : "them") twice"
             )
+            // Dropped, so not proof of anything: the next ping is owed from the last one the
+            // server acknowledged, not from these. See `rollBackHeartbeatStamp`.
+            if let newestDropped = batch.filter({ $0.signal == Signal.heartbeat }).map(\.client_ts).max() {
+                rollBackHeartbeatStamp(newestDropped: newestDropped)
+            }
         }
         queue.insert(contentsOf: retryable, at: 0)
         trim()
@@ -845,6 +942,10 @@ actor Client {
     }
 
     // MARK: - Networking
+
+    /// Names the SDK and its version to the ingest, so an install still on an older release can
+    /// be told from one that has updated.
+    nonisolated static let userAgent = "AppGlance-Apple/\(AppGlance.version)"
 
     private enum SendError: Error {
         /// The status, and the server's numeric Retry-After in seconds when it sent one. The
@@ -967,6 +1068,7 @@ actor Client {
         UserDefaults.standard.removeObject(forKey: "app.appglance.session.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.sessionUnadopted.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.lastHeartbeat.\(appID)")
+        UserDefaults.standard.removeObject(forKey: "app.appglance.lastEvent.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.traits.\(appID)")
     }
 }

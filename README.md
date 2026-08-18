@@ -135,14 +135,14 @@ Every event is tagged `appstore`, `testflight`, `simulator` or `debug`. Simulato
 are compile-time facts and always tagged correctly; they are excluded by the default
 `enabledEnvironments`, and debug mode lifts that gate without changing the tag.
 
-The split between the two store channels is best effort for now. It is designed to come from
-the store's signed `AppTransaction` (the sandbox receipt heuristic and, on macOS, the
-beta-distribution signing certificate remain as fallbacks for builds the store cannot vouch
-for), and the mapping from the store's answer to these tags is covered by tests. On-device
-confirmation from a real TestFlight install is still pending, though, and TestFlight installs
-have been observed reporting `appstore` in the field, so treat the `testflight` versus
-`appstore` distinction as an aid, not a guarantee: events from a TestFlight build can appear
-in the dashboard's Live (App Store) numbers until the store's answer is confirmed on device.
+The split between the two store channels comes from the store's signed `AppTransaction`:
+`.sandbox` is TestFlight, `.production` the App Store, and `.xcode` (a store-signed build
+launched from Xcode) is tagged `debug`, so a developer's machine never appears in Live. The
+store answers asynchronously, so each launch starts from a guess - the receipt, and on macOS
+the beta-distribution signing certificate - and the first flush waits briefly for the real
+answer; anything already queued is restamped when it arrives. A build the store cannot vouch
+for at all, such as an ad hoc or enterprise build or a Mac app downloaded from a website,
+keeps the guess.
 
 ## Guarantees
 
@@ -150,15 +150,21 @@ in the dashboard's Live (App Store) numbers until the store's answer is confirme
   background queue, timestamps are taken at call time, and calls made before `configure` (or
   before the Keychain is readable after a reboot) are held - up to 200 - and replayed.
 - The install id is a random UUID in the Keychain, so delete-and-reinstall keeps it and the
-  person is counted once. `install` is recorded exactly once, first.
+  person is counted once. It is device-bound: a backup restored onto a second handset mints a
+  fresh id there rather than reporting two devices as one. `install` is recorded exactly once,
+  first.
+- Configure from the app, not from an app extension. An extension is a separate process with its
+  own container and its own Keychain access group, so it cannot see the app's install id; the SDK
+  records nothing there and says so once on the console.
 - Events are written to disk as they are tracked, so a crash loses nothing. The queue is capped
   at 500 (oldest dropped), sent oldest-first in slices of 100, one send at a time. `429`, `5xx`
   and offline keep the batch for later; `413` halves it; any other `4xx` (an unknown key, say)
   drops that slice rather than wedging the queue.
 - Retries never double-count. Every event carries a client-minted id and the server ignores
   replays; the presence ping - which is folded into rollups on arrival - is re-sent only when
-  the server provably never saw it. A flush on the way to the background runs under a process
-  assertion, so iOS does not suspend the app mid-request.
+  the server provably never saw it, and a ping dropped instead of retried stops pacing the next
+  one, so presence is proved again rather than waiting out a second interval. A flush on the way
+  to the background runs under a process assertion, so iOS does not suspend the app mid-request.
 
 ## Bring your own Supabase
 

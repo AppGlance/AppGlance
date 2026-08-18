@@ -30,6 +30,9 @@ import Foundation
 /// first unlock - are held (up to 200) and replayed once the SDK is ready.
 public enum AppGlance {
 
+    /// The SDK version, sent as the `User-Agent` of every request.
+    public static let version = "1.2.0"
+
     /// The whole hosted setup: one write key from the dashboard's Setup page. Call once, as
     /// early as possible - your `App` initializer, or `application(_:didFinishLaunching…)`.
     ///
@@ -44,7 +47,22 @@ public enum AppGlance {
     /// Configure with full control: intervals, environments, a self-hosted endpoint, or your
     /// own Supabase project. Call once, as early as possible.
     public static func configure(_ configuration: Configuration) {
+        guard !isAppExtension() else {
+            Log.line(
+                "not collecting in this process: AppGlance runs in the app, not in its extensions. An extension is"
+                    + " a separate process with its own container and its own Keychain access group, so it cannot see"
+                    + " the app's install id: it would mint a second one, record a second install, and report one"
+                    + " device as two users. Configure from the app instead.")
+            return
+        }
         intake.yield(.configure(configuration, KeychainIdentityStore(), .shared, Date()))
+    }
+
+    /// Whether this process is an app extension (a widget, a share sheet, a notification service)
+    /// rather than the app. Its bundle is the tell: extensions are `.appex` bundles and declare
+    /// `NSExtension`.
+    static func isAppExtension(_ bundle: Bundle = .main) -> Bool {
+        bundle.bundleURL.pathExtension == "appex" || bundle.infoDictionary?["NSExtension"] != nil
     }
 
     /// Records an event. `signal` is a short, stable, lowercase name (`paywall.viewed`);

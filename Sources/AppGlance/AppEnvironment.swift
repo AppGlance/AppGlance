@@ -7,10 +7,10 @@ import StoreKit
 /// `AppGlance.Configuration.enabledEnvironments`), and the dashboard's Live scope shows App Store
 /// only. Debug mode lets the current build send regardless; the tag stays truthful either way.
 ///
-/// `.simulator` and `.debug` are compile-time facts. `.testFlight` versus `.appStore` is best
-/// effort: the tag is designed to follow the store's signed `AppTransaction`, and that mapping
-/// is covered by tests, but on-device confirmation from a real TestFlight install is still
-/// pending and TestFlight installs have been observed reporting `appstore` in the field.
+/// `.simulator` and `.debug` are compile-time facts. `.testFlight` versus `.appStore` comes from
+/// the store's signed `AppTransaction`: `.sandbox` is TestFlight, `.production` the App Store.
+/// The store answers asynchronously, so a launch starts from a guess and the first flush waits
+/// briefly for the real answer; whatever is still queued is restamped when it arrives.
 public enum AppEnvironment: String, Sendable, CaseIterable {
     case appStore = "appstore"
     case testFlight = "testflight"
@@ -43,16 +43,13 @@ public enum AppEnvironment: String, Sendable, CaseIterable {
 
     /// The store's answer for where this build runs, or nil when it has none right now.
     ///
-    /// The receipt heuristic below stopped telling TestFlight and the App Store apart when the
-    /// legacy receipt retired with the iOS 18 SDK: both channels now get a URL ending in plain
-    /// `receipt`, so a TestFlight install reads as App Store. The signed `AppTransaction` is
-    /// designed to name the channel that delivered this build; on-device confirmation from a
-    /// real TestFlight install is still pending, and TestFlight installs have been observed
-    /// reporting `appstore` in the field. A fresh install may also have nothing cached to
-    /// answer with and the fetch can fail (an offline first launch, an ad hoc or enterprise
-    /// build). Callers treat nil as "ask again later", never as an answer, and
-    /// `AppTransaction.refresh()` is not an option: it can put a sign-in prompt on screen,
-    /// which an analytics SDK must never do.
+    /// The signed `AppTransaction` names the channel that delivered this build. The receipt
+    /// cannot: under the iOS 18 SDK both channels get a URL ending in plain `receipt`, so the
+    /// heuristic below reads a TestFlight install as App Store and stands only as the guess a
+    /// launch starts from. A fresh install may have nothing cached to answer with and the fetch
+    /// can fail (an offline first launch, an ad hoc or enterprise build). Callers treat nil as
+    /// "ask again later", never as an answer, and `AppTransaction.refresh()` is not an option:
+    /// it can put a sign-in prompt on screen, which an analytics SDK must never do.
     static func storeAnswer() async -> (answer: AppEnvironment?, failure: String?) {
         guard !isCompileTimeDetermined else { return (nil, nil) }
         do {

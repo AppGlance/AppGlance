@@ -22,8 +22,10 @@ agree on the shape.
 ## Releasing
 
 1. Move the `[Unreleased]` entries in `CHANGELOG.md` under a new `## [x.y.z] - YYYY-MM-DD`
-   heading and commit.
-2. Re-measure the footprint. The README and the appglance.app homepage quote it ("~200 KB", "no
+   heading.
+2. Set `AppGlance.version` to the new number and commit. It is the `User-Agent` every request
+   carries, so a stale one makes the fielded versions unreadable.
+3. Re-measure the footprint. The README and the appglance.app homepage quote it ("~200 KB", "no
    third-party dependencies"), and a stale number is worse than none:
 
    ```bash
@@ -31,8 +33,8 @@ agree on the shape.
    size /tmp/appglance-dd/Build/Products/Release-iphoneos/AppGlance.o    # __TEXT + __DATA ≈ what an app gains
    ```
 
-   1.0.0 measured ≈197 KB. If it moves past the quoted figure, update the README (and tell
-   whoever maintains the site).
-3. `git tag x.y.z && git push origin main x.y.z`.
-4. The Release workflow publishes a GitHub Release with that changelog section as its notes;
+   1.0.0 measured ≈197 KB, 1.2.0 ≈208 KB. If it moves past the quoted figure, update the README
+   (and tell whoever maintains the site).
+4. `git tag x.y.z && git push origin main x.y.z`.
+5. The Release workflow publishes a GitHub Release with that changelog section as its notes;
    Swift Package Manager picks the new version up from the tag.
