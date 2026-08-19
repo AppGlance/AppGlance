@@ -297,7 +297,7 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
   before this. An explicit `flush()` and the flush on backgrounding are not held by it, as before.
 - A numeric `Retry-After` is honoured on any answered status, not on a `429` alone. A `503` that
   states one was previously ignored and the SDK backed off on its own schedule instead. The
-  15 minute clamp still bounds it. The Kotlin SDK still reads the header on a `429` only.
+  15 minute clamp still bounds it. The Kotlin SDK makes the same change in the same release.
 - The offline queue file is no longer rewritten by a delivery that cannot change what is owed.
   Claiming a slice with no presence ping in it, and handing that same slice back after a
   transient failure, both leave the file saying exactly what it already said, and each used to
