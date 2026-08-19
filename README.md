@@ -5,7 +5,7 @@
 The Swift SDK for [AppGlance](https://appglance.app): privacy-first, live analytics for apps.
 It answers who is using your app right now, how many opened it today, where they are, and
 anything you choose to track - with a random install id as the only identity, no IDFA, no
-consent banner, and one line of setup. The Kotlin SDK is at
+consent banner, and two lines of setup. The Kotlin SDK is at
 [AppGlance/appglance-android](https://github.com/AppGlance/appglance-android).
 
 ## Install
@@ -52,14 +52,19 @@ struct MyApp: App {
 ```
 
 `.trackAppLifecycle()` on your root view records `session.start` when the app comes to the
-front after more than five minutes away, keeps a once-a-minute presence ping running while it is
-in front, and flushes when it leaves. Brief interruptions - a notification, a quick app switch -
-do not start a new session; neither does quitting and relaunching inside the timeout.
+front after more than five minutes away, sends a presence ping once the app has been in front for
+a minute with nothing else sent - a real event proves presence exactly as a ping does, so an app
+that is sending events never pings - and flushes when it leaves. The server may ask for a sparser
+cadence for your account's plan, and the SDK then uses that. Brief interruptions - a notification,
+a quick app switch - do not start a new session; neither does quitting and relaunching inside the
+timeout.
 
 It is not optional. Nothing else reports foreground and background, so without it no session
 ever opens, "active right now" stays empty, and every event the install sends belongs to one
-session that never ends. If the SDK is configured and no foreground signal arrives within ten
-seconds, it prints one line to the console saying exactly that.
+session that never ends. If the SDK is configured and sending, and no foreground signal arrives
+within ten seconds, it prints one line to the console saying exactly that. A build the
+environment gate has closed prints why it is silent instead, so turn on `debug: true` to see the
+lifecycle warning from a Simulator or Debug run.
 
 UIKit apps report the same transitions themselves, from the scene or application delegate:
 
@@ -122,7 +127,7 @@ AppGlance.configure(AppGlance.Configuration(
 | `maxBatchSize` | `20` | Send at once when this many events are queued. Clamped to 1-500, the largest batch the ingest API accepts. |
 | `heartbeatInterval` | `60` s | Seconds of silence in the foreground before a presence ping (drives "active now"). A real event resets it; the server may raise it for the account's plan. Never billable. Clamped to 15-3600: there is no way to switch presence off here. |
 | `sessionTimeout` | `300` s | Away longer than this and coming back is a new session - the dashboard splits on the same gap. Clamped to 1-86400. |
-| `isEnabled` | `true` | Master off-switch (e.g. behind a user setting). Wins over everything, including `debug`. Turning it off also discards whatever an earlier run left queued on disk, so a consent withdrawal covers events already recorded. |
+| `isEnabled` | `true` | Master off-switch (e.g. behind a user setting). Wins over everything, including `debug`. Turning it off also discards whatever an earlier run left queued on disk and the user properties `identify` stored, so a consent withdrawal covers what was already recorded, not just what comes next. |
 | `collectsCountry` | `true` | The device's region *setting* as a two-letter code. Not GPS, not IP. |
 | `enabledEnvironments` | `[.appStore, .testFlight]` | Which environments send; Simulator and Debug builds never do by default. |
 | `debug` | `false` | Sends from any environment (tag stays truthful) and logs to the console. |
