@@ -33,8 +33,11 @@ agree on the shape.
    size /tmp/appglance-dd/Build/Products/Release-iphoneos/AppGlance.o    # __TEXT + __DATA ≈ what an app gains
    ```
 
-   1.0.0 measured ≈197 KB, 1.2.0 ≈208 KB. If it moves past the quoted figure, update the README
-   (and tell whoever maintains the site).
+   1.0.0 measured ≈197 KB and 1.2.0 ≈208 KB on the toolchain of their day; 1.2.1 measures
+   ≈268 KB with Swift 6.3.3, and the tagged 1.2.0 measures the same there, so that jump is the
+   compiler's, not the code's. Compare like with like: measure the previous tag with the same
+   toolchain before reading a diff as growth. If the figure moves past what is quoted, update the
+   README (and tell whoever maintains the site).
 4. `git tag x.y.z && git push origin main x.y.z`.
 5. The Release workflow publishes a GitHub Release with that changelog section as its notes;
    Swift Package Manager picks the new version up from the tag.
