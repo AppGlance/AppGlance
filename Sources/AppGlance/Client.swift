@@ -16,7 +16,7 @@ actor Client {
     private let now: @Sendable () -> Date
 
     /// Hard cap on the queue, so repeated failures cannot grow it without bound. Oldest first.
-    private let maxQueuedEvents = 500
+    private static let maxQueuedEvents = 500
     /// Events per request. The ingest API accepts up to 500 events / 256 KB per batch; a
     /// long-offline queue drains in slices this size rather than as one oversized POST.
     private let maxEventsPerRequest = 100
@@ -583,6 +583,10 @@ actor Client {
                 let waiting = Self.loadPersisted(from: storeURL)
                 inheritedEventIDs.formUnion(waiting.map(\.event_id))
                 queue = waiting + queue
+                // Two capped queues concatenated are twice the cap. Trimmed here rather than at
+                // the next `track`, which on a build that has just been let through the gate may
+                // be a long way off.
+                trim()
             }
             // The slice on the wire is restamped with the queue, by the same rule. Those events
             // are beyond recall as sent, but `persist` writes them as the crash record, and a
@@ -1424,8 +1428,8 @@ actor Client {
     }
 
     private func trim() {
-        if queue.count > maxQueuedEvents {
-            queue.removeFirst(queue.count - maxQueuedEvents)
+        if queue.count > Self.maxQueuedEvents {
+            queue.removeFirst(queue.count - Self.maxQueuedEvents)
         }
     }
 
@@ -1644,7 +1648,14 @@ actor Client {
 
     nonisolated private static func loadPersisted(from url: URL) -> [Event] {
         guard let data = try? Data(contentsOf: url) else { return [] }
-        return (try? EventCoding.makeDecoder().decode([Event].self, from: data)) ?? []
+        let stored = (try? EventCoding.makeDecoder().decode([Event].self, from: data)) ?? []
+        // Trimmed on the way in, not left to the next `track`. The file holds what is OWED, which
+        // is the queue plus the non-ping half of the slice that was on the wire, so it can carry
+        // `maxEventsPerRequest` more than the queue's own cap. Restoring it whole started the
+        // launch over that cap and kept it there until something else was tracked, which is how a
+        // documented 500-event ceiling became 600 on exactly the launch that follows a crash.
+        // Oldest first, the same end the cap drops from everywhere else.
+        return stored.count > maxQueuedEvents ? Array(stored.suffix(maxQueuedEvents)) : stored
     }
 
     nonisolated static func makeStoreURL(appID: String) -> URL {

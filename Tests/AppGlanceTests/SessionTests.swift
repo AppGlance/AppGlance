@@ -849,6 +849,27 @@ final class SessionTests: XCTestCase {
             try TestSupport.persistedSignals(id), ["a"], "the event is owed, so something on disk has to say so")
     }
 
+    /// The queue file holds what is OWED, which is the queue plus the non-ping half of the slice
+    /// that was on the wire, so it can legitimately carry a whole request more than the queue's
+    /// own cap. Restoring it whole started the next launch over that cap and left it there until
+    /// something else was tracked, so the documented 500-event ceiling was really 600 on exactly
+    /// the launch that follows a crash mid-delivery. The Kotlin SDK trims on the same path.
+    func testAQueueFileHoldingMoreThanTheCapIsTrimmedOnTheWayIn() async throws {
+        let id = "test.session.restore.cap"; isolate(id)
+        let client = makeClient(appID: id, clock: TestClock())
+        for i in 0..<300 { await client.track(signal: "e\(i)", metadata: nil) }
+        let url = Client.makeStoreURL(appID: id)
+        let stored = try EventCoding.makeDecoder().decode([Event].self, from: Data(contentsOf: url))
+        XCTAssertEqual(stored.count, 300, "nothing is trimmed under the cap")
+
+        // A file carrying 600 owed events: the shape a kill mid-delivery leaves behind.
+        try EventCoding.makeEncoder().encode(stored + stored).write(to: url)
+        XCTAssertEqual(try TestSupport.persistedSignals(id).count, 600, "the file really does hold 600")
+
+        let restored = await makeClient(appID: id, clock: TestClock()).pendingEvents().count
+        XCTAssertEqual(restored, 500, "the launch starts at the cap, not over it")
+    }
+
     /// The elision remembers what LANDED, not what was offered. A store that refuses a write and
     /// says so must not leave the client believing the file holds those bytes, because the write
     /// that follows is very often the identical one: claiming a slice and handing it back both
