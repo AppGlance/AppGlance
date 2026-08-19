@@ -31,7 +31,7 @@ import Foundation
 public enum AppGlance {
 
     /// The SDK version, sent as the `User-Agent` of every request.
-    public static let version = "1.2.0"
+    public static let version = "1.2.1"
 
     /// The whole hosted setup: one write key from the dashboard's Setup page. Call once, as
     /// early as possible - your `App` initializer, or `application(_:didFinishLaunching…)`.

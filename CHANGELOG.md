@@ -6,6 +6,18 @@ All notable changes to the AppGlance Swift SDK. The format follows
 [GitHub Release](https://github.com/AppGlance/appglance-apple/releases) with the same notes.
 The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-android/blob/main/CHANGELOG.md).
 
+## [1.2.1] - 2026-08-19
+
+### Fixed
+
+- The 500-event queue cap holds on the launch after a crash, and when a late environment answer
+  opens the gate. The file holds what is OWED, which is the queue plus the non-ping half of the
+  slice that was on the wire, so it can carry a whole request more than the cap; restoring it
+  whole started that launch at up to 600 and left it there until something else was tracked. The
+  gate-open path is worse: it puts the file in front of the queue this run already has, and two
+  capped queues concatenated are twice the cap. Both are trimmed where they are read, oldest
+  first, the same end the cap drops from everywhere else. The Kotlin SDK trims on the same path.
+
 ## [1.2.0] - 2026-08-19
 
 ### Fixed
