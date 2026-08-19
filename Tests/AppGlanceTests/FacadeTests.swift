@@ -6,9 +6,15 @@ import XCTest
 /// before `configure` are held and replayed, and a second `configure` replaces the client cleanly.
 final class FacadeTests: XCTestCase {
 
+    /// No periodic ping in this suite. These tests assert on exact signal lists while the app is
+    /// in front, and the presence loop is armed by wall clock, not by the test clock: at the
+    /// default interval a machine slow enough to spend a minute between `setActive(true)` and the
+    /// assertion folds a `heartbeat` into the list and fails a test that is not about presence.
+    /// The guard against a ping that fires when it should not still holds, because the tests that
+    /// check for one measure in fractions of a second.
     private func configure(_ appID: String, store: InMemoryIdentityStore) {
         AppGlance.configure(
-            TestSupport.configuration(appID: appID), identityStore: store,
+            TestSupport.configuration(appID: appID, heartbeatInterval: 3600), identityStore: store,
             session: TestSupport.recordingSession())
     }
 
