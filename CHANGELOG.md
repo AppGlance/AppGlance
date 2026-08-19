@@ -6,7 +6,7 @@ All notable changes to the AppGlance Swift SDK. The format follows
 [GitHub Release](https://github.com/AppGlance/appglance-apple/releases) with the same notes.
 The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-android/blob/main/CHANGELOG.md).
 
-## [Unreleased]
+## [1.2.0] - 2026-08-19
 
 ### Fixed
 
@@ -20,11 +20,202 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
   already held the old device's user properties, so `identify` with those values sent nothing and
   the install's page in the dashboard stayed empty however often the app called it. State left by
   an install that is not this one is now dropped when an id is minted.
-
-## [1.2.0] - 2026-08-18
-
-### Fixed
-
+- A late answer about where this build runs no longer destroys the queue another build left on
+  disk. The initializer states the rule: the queue file is deleted when consent is withdrawn and
+  never when the environment gate closes, because a debuggable build run over an installed
+  release copy shares that file and must not throw away a real queue the shipped build saved
+  during an outage. Adopting the store's answer broke it by writing the queue over the file
+  unconditionally, in both directions. An app that collects from betas only guesses App Store on
+  every launch, so the answer opened its gate and wrote an empty file over the events its own
+  last run had left, and no outage backlog could ever survive a relaunch; a Release build
+  launched from Xcode over an App Store copy loaded that copy's queue and then wrote an empty
+  file in its place. An answer that closes the gate now keeps exactly what this client inherited
+  and drops only what this run recorded under the guess, including the slice on the wire; an
+  answer that opens it reads the file the client was not allowed to read at startup; and a
+  client that is no longer collecting neither writes that file nor puts a failed batch back into
+  a queue it will never send.
+- A gate that opens late starts a session instead of joining one that is over. The initializer
+  decides a session in two steps and only the second is inside its `collecting` check, so a
+  client the gate had closed began holding whatever session id the last run left behind, however
+  old. Adopting the store's answer tested only whether that id was missing, so it kept a session
+  that had ended days earlier and filed every event recorded before the first foreground into
+  it, which the dashboard reads as one visit spanning both. The answer now asks the same
+  question the initializer asks: an id a previous run pre-minted and never opened is reused and
+  still owed its `session.start`, a session inside `sessionTimeout` is resumed, and anything
+  else gets a new id, minted and written down before a single event can carry it.
+- A first launch that cannot send no longer costs the install its `install` event. The id is
+  minted and stored before anything knows whether this build collects, and a launch behind a
+  closed environment gate (the default excludes Debug and the Simulator) or with
+  `isEnabled: false` while the app waits for consent records nothing. Every later launch found
+  the stored id, so the one launch that could have recorded the event was already over and the
+  install never appeared at all: a developer's first Run, then TestFlight, was enough to lose it
+  for good. A launch that mints the id and cannot record now notes the debt, and the first launch
+  that is collecting records `install`, stamped with its own `configure`. The same applies inside
+  one run: a store answer that opens the gate records the install its client could not.
+- Two flushes can no longer overlap. A flush claimed the send only after waiting for the store's
+  environment label, so a second flush arriving during that wait found the slot free, passed the
+  same checks and began a drain of its own. Both then wrote to the single record of the slice on
+  the wire, and the first one's batch ended up in neither the queue nor the file a killed process
+  is recovered from; the second one's events left carrying the label the first was still waiting
+  to correct; and a flush holding the process open for a send could return, and let the process
+  suspend, while that send was still in flight. A flush now claims the send before it waits for
+  anything, so a second one joins the whole of it.
+- The three-second wait for the store's environment label is now a limit. It raced the ask against
+  a timer inside a task group, and a task group returns only once every child has finished, so the
+  timer expiring ended nothing and the first flush of a launch waited for `AppTransaction` however
+  long it took. On the launch where that is slowest, one with no network, the batch on the way to
+  the background missed the window its process assertion holds open.
+- The user-properties snapshot records what the server acknowledged, not what was queued.
+  `identify` committed the merged set the moment it queued the `user.identify` carrying it, and
+  only a change is ever sent, so any event lost after that froze the install's properties for
+  good: the 500-event cap trimming the oldest, a permanent `4xx` dropping the slice, or the ingest
+  answering `202` while storing nothing (past the plan's grace ceiling, or under the per-install
+  rate limiter). The install's page in the dashboard then stayed blank however often the app
+  called `identify` with the same values, which the documentation tells it to do at every launch.
+  The snapshot now moves only when a batch carrying that event comes back accepted and counted
+  whole; what an event still owed will leave behind is read from the queue itself, so an
+  `identify` made while an earlier one is in flight merges on top of it instead of re-sending it,
+  and a repeat of values the server really has is still free.
+- Withdrawing consent now clears the user properties as well as the queue. `isEnabled: false`
+  discarded the queued events, but `$email`, `$name` and `$id` stayed in `UserDefaults`, inside
+  the iCloud and the encrypted backup, and `reset()` - the only other thing that clears them -
+  records nothing on a client that is not collecting. So the natural order of honouring a
+  withdrawal, turn collection off and then forget the person, left them on disk indefinitely.
+  They are deleted with the queue now, keyed on `isEnabled` alone: a closed environment gate is
+  not a withdrawal and still leaves both alone. The install id is untouched, so turning
+  collection back on is the same install rather than a new one.
+- A second `configure` while the app is on screen no longer leaves the SDK inactive for the rest
+  of the visit. Every client starts out believing the app is in the background, and nothing told
+  the replacement otherwise: SwiftUI reports the front through `onAppear` and through scene-phase
+  changes, and a `configure` in the middle of a visit is neither, so the one documented way to
+  apply a consent change silently stopped the SDK dead. No `session.start`, no presence ping at
+  all, no flush on the way to the background, and no last-active stamp, which then skewed the
+  next launch's resume-or-new-session decision. A `configure` now hands the replacement the last
+  foreground state the app reported, so it rejoins the session already running rather than
+  opening a second one. What the app reported is what is carried, not what the outgoing client
+  made of it: an app that configured with `isEnabled: false` while it waited for consent has a
+  client that never became active, and its visit still opens a session the moment consent is
+  granted. A reported background carries nothing but the fact that this app does report its
+  lifecycle, so no session is invented for an app that is not on screen and no console line
+  accuses it of forgetting `.trackAppLifecycle()`.
+- A presence stamp in the future no longer silences the presence ping. The last-ping, last-event
+  and last-active stamps were restored from disk and used as read, with no check against the
+  clock, while the server's cadence floor sitting on the next line was checked. A device whose
+  clock ran hours ahead wrote all three ahead of real time, and after the correction the silence
+  they measure read as negative: no ping was ever due again, on that launch and on every launch
+  after it, so an install in the foreground the whole time dropped out of "active right now" and
+  its sessions ended early. The stamps now get the same treatment as the cadence floor, a value
+  that cannot be true is discarded rather than obeyed, and every decision taken from one - resume
+  this session or start a new one, is a ping owed, does leaving deserve a closing tick - reads an
+  unmeasurable gap as a long one, which is the safe direction for all three. A clock corrected
+  backwards during a visit is caught the same way, where the startup check cannot see it: the
+  stamps this process wrote ahead of the new time are dropped once, one ping proves presence, and
+  the interval paces the next.
+- On macOS the install id is now kept where the device binding actually holds. The item was
+  written with `…ThisDeviceOnly`, but the query never named a keychain, and a query that does not
+  name one gets the file-based login keychain, where Apple documents that attribute as having no
+  effect. Migration Assistant and a Time Machine restore copy that keychain onto the next Mac
+  verbatim, so the id travelled, the new Mac was not a new install, and two machines in daily use
+  reported as one. The query now names the data protection keychain on macOS, and an id an
+  earlier version left in the login keychain is moved across rather than hidden, so no existing
+  Mac install is renumbered: it is deleted from the old keychain only once its replacement is
+  written, and a build that cannot reach the data protection keychain at all (an app signed
+  without the entitlement that grants a keychain access group) keeps the id exactly where the
+  next launch will find it. Every other platform has one keychain and ignores the key, so the
+  query they send is unchanged.
+- The install id's local mirror can no longer be left inside backups. Marking the file excluded
+  from backup is a separate call from writing it and its failure is silent, and it was attempted
+  only when the contents changed, so one failure was permanent: every later write found the id
+  already there and returned early. The file then rode along in the iCloud and encrypted backups
+  for the life of the install, which is what carries an id to a second device and makes two
+  handsets report as one. The exclusion is now checked whenever the mirror is written.
+- A minted install id that the store did not keep is no longer reported as a new install. The id
+  was returned as new without asking whether the save landed, and neither the Keychain write nor
+  the mirror write can report failure. A build where both fail - an unentitled Mac app whose
+  Caches directory is also unwritable - minted a different id on every launch and recorded an
+  `install` for each, so one device arrived as an unbounded stream of users that nothing on the
+  server could collapse. The id is now read back before it is claimed, and a run whose id nothing
+  kept uses it for its events and records no install, the same trade the unreadable-store case
+  already made.
+- `install` is no longer stamped later than the calls that were made before `configure`. Calls
+  made before the SDK is configured are held and replayed, and each keeps the moment the app made
+  it, while `install` was stamped with `configure` - so an app that tracks from an initializer
+  running ahead of `configure` sent an `install` dated after an event that preceded it, and the
+  platform's first-seen rollup takes the smallest timestamp an install ever sends. `install` now
+  carries the earliest moment the SDK holds for that install.
+- A batch rejected for good no longer costs the install a whole interval of presence. A permanent
+  `4xx` drops the slice, and the ingest rejects a batch like that before it reads a row, so any
+  presence pings in it were provably never counted - but their stamp was left in place, so the
+  next ping was not due for a full interval. At the cadence a free-plan account is asked for that
+  is longer than the dashboard's five-minute presence window, so an install in the foreground the
+  whole time dropped out of "active right now". The stamp is now rolled back to the last ping the
+  server acknowledged, which is what the retryable path already did.
+- An automatic flush no longer retries inside the backoff it should be obeying. The flush timer
+  read the backoff before joining the send in progress, so a timer that fired while a request was
+  out saw no backoff, waited out that request, and then went straight at a server that had just
+  asked for room, counting a second failure from one outage. The backoff is read after joining.
+  An explicit `flush()` still always attempts.
+- User-property keys and values are clamped in the units the ingest counts in. The SDK cut at 40
+  and 200 characters and the server cuts at 40 and 200 UTF-16 code units, so any value outside
+  the basic plane - an emoji, a flag, most non-Latin scripts - was stored by the server shorter
+  than the SDK remembered it. The snapshot could then never match what was stored, and because
+  only a change is sent, no later `identify` with the same values could correct it. A cut that
+  would split a surrogate pair now drops the half rather than sending one.
+- A store answer that opens the environment gate now also restamps the batch already on the wire,
+  arms the missing-lifecycle check its client refused while gated, and records the install it
+  could not. The first of those matters after a crash: the copy kept for a killed process still
+  carried the guessed label, so a next launch that never got an answer of its own would have
+  delivered beta or development traffic into the dashboard's Live scope. The second matters
+  because a build the startup guess gated out and the answer let through is a shipping build that
+  is sending, which is exactly where a missing `.trackAppLifecycle()` costs every session.
+- A store answer that closes the gate now gives back the presence stamps that run had moved. The
+  last-event stamp is written on every `track` and belongs to the install, not to the run, so a
+  Release build launched from Xcode over the installed App Store copy left the shipped build
+  owing no presence ping for up to a whole interval on its next launch, for a moment it had
+  nothing to do with. The events are dropped, and the stamps they moved go with them.
+- A store answer that closes the gate no longer costs the install its `install` event. A launch
+  that mints the install id and is collecting records the event and clears the note that says one
+  is owed, and an answer arriving a moment later drops everything that launch recorded. The debt
+  went with it, and `isNewInstall` is true on that one launch only, so every later launch found
+  the stored id, owed nothing, and the install never appeared in the dashboard at all. It is the
+  ordinary path rather than a corner: the startup heuristic reads a TestFlight install as App
+  Store, so every tester of an app that collects from App Store builds only arrived here on their
+  first launch. The debt now goes back on disk whenever the close discards this run's own
+  `install`, so the first launch that really collects records it. A copy already claimed for the
+  wire is left alone: it may still be accepted, and a re-recorded install carries a new event id
+  that the ingest's dedupe has nothing to collapse it against.
+- A store answer that closes the gate now gives back the session state that run had adopted, along
+  with the presence stamps. The close keeps what an earlier build left on disk, and one of the
+  things that build can leave is a session id pre-minted and never opened, still owed its
+  `session.start`, with events already carrying it. This run's first foreground adopted that id
+  and cleared the marker that says it is owed, and the close returned the events without it: the
+  sending build's next launch found no session pending, minted a fresh id over the top, and those
+  events stayed filed under a session the server is never told about. The id and the marker are
+  now restored with the stamps, so a run that is told it should never have been collecting leaves
+  the whole of that state as it found it.
+- A batch rejected for good no longer restarts the presence loop on a build the store's answer has
+  just gated out. Dropping a permanent `4xx` re-arms the presence timer from the last ping the
+  server acknowledged, and the answer can close the gate while that batch is still on the wire, so
+  the loop came back on a client whose events go nowhere. The two stamps a ping writes before
+  anything asks whether this build sends are the install's, shared by every build in the
+  container: a Release build run from Xcode against a rotated write key went on proving a presence
+  the shipped build had not proved, and moving the stamp its next launch judges
+  resume-or-new-session by, once per interval for the rest of the visit. The roll-back and the
+  ping itself both stop now at a client that is no longer collecting.
+- A second session opened inside one process now writes its id down before the event that carries
+  it. The `session.start` was queued, and persisted, ahead of the id reaching preferences, so a
+  process killed in that window - a force-quit as the app is coming back - left a start for a
+  session nothing on disk named, and the next launch inside the timeout resumed the id before it
+  and filed the whole visit under a session it never opened. The pre-minted id was already
+  written in this order; this is the one mint that was not.
+- The batch POST no longer follows redirects. `URLSession` follows them by default and re-applies
+  the original request's headers to the new one, so a `301` or `302` from a proxy, a captive
+  portal, or an `endpoint` host that has changed hands carried the write key - and whatever a
+  `user.identify` was holding, an email and a name - to whatever host the answer named, and a
+  `2xx` from that host was read as the batch being delivered, so the events were dropped as well.
+  A redirect is now refused and treated as a failed attempt, so the queue keeps the batch and
+  retries against the configured host. The Kotlin transport already refused them; the two SDKs
+  now answer this the same way.
 - The install id no longer follows a restore onto a second device. The Keychain item was always
   `…ThisDeviceOnly`, but the copy kept beside it, as insurance against a momentary Keychain
   failure, lived in `UserDefaults` - which an iCloud or encrypted backup and a device-to-device
@@ -91,6 +282,39 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
 
 ### Changed
 
+- A burst of events leaves the device as one delivery rather than one request per event. The send
+  loop is fed by the same queue the app is writing to, so an app recording as fast as the network
+  answers - a screenful of items, a replayed queue of user actions - had every round after the
+  first find exactly the one event tracked during the last round trip and send it on its own: a
+  full set of request headers and a round trip each. A delivery now sends what was owed when it
+  began, and the batch-size trigger asks for one delivery at a time rather than one for every
+  event past the threshold. Anything tracked after a delivery begins goes with the next one, which
+  the delivery arms before it returns. The Kotlin SDK bounds its drain the same way.
+- Automatic delivery backs off further during a long outage. The retry ceiling stays at 60 seconds
+  for the first ten consecutive failures and widens to five minutes past that: after ten attempts a
+  server is having an outage rather than a blip, and the on-disk queue serves the install better
+  than a tight retry does. An hour of `503` cost 85 attempts and 2.68 MB of re-uploaded queue head
+  before this. An explicit `flush()` and the flush on backgrounding are not held by it, as before.
+- A numeric `Retry-After` is honoured on any answered status, not on a `429` alone. A `503` that
+  states one was previously ignored and the SDK backed off on its own schedule instead. The
+  15 minute clamp still bounds it. The Kotlin SDK still reads the header on a `429` only.
+- The offline queue file is no longer rewritten by a delivery that cannot change what is owed.
+  Claiming a slice with no presence ping in it, and handing that same slice back after a
+  transient failure, both leave the file saying exactly what it already said, and each used to
+  pay a full atomic rewrite, which costs about as much for four hundred bytes as for two hundred
+  kilobytes. An ordinary session loses one queue write in three, and a foregrounded install
+  riding out a server outage with a deep queue stops writing the file between attempts
+  altogether. What is written, and the moment at which a tracked event becomes durable, are
+  unchanged.
+- The README's setup section and the `Signal.heartbeat` documentation describe the presence ping
+  the SDK actually sends: one after `heartbeatInterval` of silence in the foreground, none while
+  real events are flowing, and a sparser cadence when the server asks for one. Both still
+  promised a ping every interval, which the SDK stopped sending in 1.1.0, and the README's setup
+  section contradicted its own configuration table further down the same file.
+- The README says what the missing-lifecycle warning actually promises, and what setup actually
+  costs. The warning is printed only by a build that is sending, so a Debug run with the default
+  environment gate never sees it; and the intro sold "one line of setup" while the section below
+  it called `.trackAppLifecycle()` not optional, which is a second.
 - The environment refinement stops asking. A build the store can never answer for - a Mac app
   downloaded from a website, an ad hoc or enterprise build, a device where StoreKit is
   restricted - re-asked on every flush for the life of the process and stalled each flush behind
