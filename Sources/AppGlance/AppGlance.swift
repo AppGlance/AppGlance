@@ -162,12 +162,29 @@ public enum AppGlance {
     /// Commands that arrived before the SDK could take them.
     nonisolated(unsafe) private static var waiting: [Command] = []
     private static let maxWaiting = 200
+    /// Where the app is, according to the client a `configure` has just replaced, stamped with
+    /// the moment that `configure` was called. It is handed to the replacement as its first
+    /// command after `install`, because nothing else will: SwiftUI reports the front through
+    /// `onAppear` and through scene-phase changes, and a configure mid-visit is neither, so the
+    /// replacement would otherwise sit inactive for the rest of the visit. `setActive` is
+    /// idempotent and judges resume-or-new-session from the persisted stamps, so the replacement
+    /// rejoins the running session instead of opening a second one; a `false` wakes nothing up
+    /// and carries only the fact that this app does report its lifecycle. nil when the app has
+    /// reported nothing at all: no client is told where the app is on the strength of a guess,
+    /// and a replacement that inherits no signal must still be free to say the modifier is missing.
+    nonisolated(unsafe) private static var handover: (active: Bool, at: Date)?
 
     private static func pump(_ stream: AsyncStream<Command>) async {
         for await command in stream {
             switch command {
             case .configure(let configuration, let store, let session, let at):
-                await client?.shutdown()
+                handover = nil
+                if let outgoing = client {
+                    if let active = await outgoing.reportedForegroundState() {
+                        handover = (active: active, at: at)
+                    }
+                    await outgoing.shutdown()
+                }
                 client = nil
                 pending = PendingConfiguration(configuration: configuration, store: store, session: session, at: at)
             case .barrier(let continuation):
@@ -177,6 +194,7 @@ public enum AppGlance {
                 await client?.shutdown()
                 client = nil
                 pending = nil
+                handover = nil
                 waiting.removeAll()
                 continue
             default:
@@ -194,6 +212,12 @@ public enum AppGlance {
                 continue
             }
             await client.recordInstallIfNeeded()  // `install` goes first, always
+            if let handedOver = handover {
+                // Ahead of the replay and of the command that started this client: where the app
+                // is was true before any of them were called.
+                handover = nil
+                await client.setActive(handedOver.active, at: handedOver.at)
+            }
             if !waiting.isEmpty {
                 let replay = waiting
                 waiting.removeAll()
@@ -213,9 +237,16 @@ public enum AppGlance {
         // `withinBounds()` again, not only in the initializer: `Configuration`'s properties are
         // `var`s, so an interval assigned after the struct was built would otherwise reach the
         // client - and its sleeps and its presence loop - unchecked.
+        // `install` is stamped with the earliest moment this SDK holds for the install, which is
+        // `configure` unless calls made before it are still waiting. The README promises `install`
+        // is recorded first, and it is queued first, but a call an app makes from an initializer
+        // that runs ahead of `configure` carries an earlier time: the platform's first-seen
+        // rollup takes the smallest timestamp per install, so stamping `install` with `configure`
+        // dates the install after an event that provably preceded it.
         let started = Client(
             config: pending.configuration.withinBounds(), userID: identity.id,
-            isNewInstall: identity.isNew, installAt: pending.at, session: pending.session)
+            isNewInstall: identity.isNew, installAt: min(pending.at, earliestWaiting() ?? pending.at),
+            session: pending.session)
         client = started
         // TestFlight vs App Store is answered by the store asynchronously; the client's first
         // flush waits for it, so the answer lands before anything is sent. The lifecycle check
@@ -225,6 +256,20 @@ public enum AppGlance {
             await started.armLifecycleCheck()
         }
         return started
+    }
+
+    /// The moment of the oldest call still waiting to be replayed, if any.
+    private static func earliestWaiting() -> Date? {
+        waiting.compactMap { command -> Date? in
+            switch command {
+            case .track(_, _, let at), .identify(_, let at), .reset(let at), .setActive(_, let at):
+                return at
+            case .configure(_, _, _, let at):
+                return at
+            case .flush, .barrier, .resetState:
+                return nil
+            }
+        }.min()
     }
 
     /// Every case is a quick hop into the actor; nothing here awaits the network, so a slow

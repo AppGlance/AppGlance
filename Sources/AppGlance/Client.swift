@@ -25,10 +25,37 @@ actor Client {
     private let maxTraitValueLength = 200
 
     private var queue: [Event]
-    /// The slice currently on the wire. See `persist()`.
+    /// The slice currently on the wire. One slot, because one delivery runs at a time: `flush`
+    /// claims `inFlight` before it suspends, so a second flush joins that delivery instead of
+    /// starting a drain whose own slice would take this one's place. See `persist()`.
     private var inFlightBatch: [Event] = []
+    /// The ids of the events this client read from the queue file instead of recording itself.
+    /// They belong to the build that wrote them, not to this run, and that difference decides
+    /// what stays on disk if a late store answer closes the environment gate: see
+    /// `adoptEnvironment`. Bounded by the queue cap, and empty on the ordinary launch that finds
+    /// no file at all.
+    private var inheritedEventIDs: Set<String>
+    /// The presence stamps this install had when the client started. They are the install's and
+    /// not this run's - every build sharing the container reads them - and until the store has
+    /// answered, this run does not know whether it was ever entitled to move them. See
+    /// `adoptEnvironment`.
+    private let startupPresence: (heartbeat: Date?, event: Date?, active: Date?)
+    /// The session this install was in the middle of when the client started, and whether it was
+    /// still owed its `session.start`. The install's too, and read before the mint in init can
+    /// move either: an answer that closes the gate has to give the pair back together, or the
+    /// events the close keeps on disk are left under a session nothing on disk names.
+    private let startupSession: (id: String?, unadopted: Bool)
+    /// The delivery in progress: the wait for the store's label, and the drain that follows.
     private var inFlight: Task<Void, Never>?
     private var flushTask: Task<Void, Never>?
+    /// True from the moment the batch-size trigger asks for a delivery until that delivery is
+    /// over. The trigger is reached again on every event past the threshold, and without this
+    /// each of those events starts a delivery of its own: it joins the one already running, then
+    /// finds the single event queued since and sends that as a request in its own right, so a
+    /// burst leaves the device as one request - one round trip, one full set of headers - per
+    /// event. Held instead, everything queued meanwhile rides along in the batch `drain` is
+    /// already sending. The Kotlin client coalesces the same way.
+    private var flushRequested = false
     private var heartbeatTask: Task<Void, Never>?
     /// The in-flight ask for the store's environment answer; each flush waits briefly for it.
     /// See `adoptStoreAnswer`.
@@ -46,8 +73,12 @@ actor Client {
     private let maxEnvironmentAsks = 5
     /// How long a flush waits for the store's answer before sending with the guessed label -
     /// a slow or offline first launch must not hold batches hostage; later flushes correct
-    /// what follows.
-    private let environmentAnswerGrace: TimeInterval = 3
+    /// what follows. Injected for the same reason `asksTheStore` is: the ask a test host makes
+    /// resolves at once, so a grace in seconds is otherwise only observable by waiting it out.
+    private let environmentAnswerGrace: TimeInterval
+    /// Flushes parked on that grace, resumed by whichever comes first: the ask settling, or the
+    /// grace running out. See `awaitEnvironmentAnswer`.
+    private var environmentWaiters: [CheckedContinuation<Void, Never>] = []
     /// True once one flush has waited out the grace. Only the first waits: after that the batch
     /// goes with the guessed label and `adoptEnvironment` restamps whatever is still queued if
     /// the answer ever arrives, so a build the store never answers for does not pay the wait
@@ -70,6 +101,10 @@ actor Client {
     private var lifecycleCheckTask: Task<Void, Never>?
     private var lifecycleCheckDone = false
     private let lifecycleSignalGrace: TimeInterval = 10
+    /// The grace the facade asked for, kept because the client that is asked is not always the
+    /// one that can arm: a closed environment gate refuses, and the store's answer re-arms later
+    /// with no caller left to ask again.
+    private var lifecycleCheckGrace: TimeInterval?
 
     // Retry backoff. Automatic delivery (the batch-size trigger, the flush timer) waits
     // exponentially longer after consecutive retryable failures, so a struggling server is not
@@ -78,13 +113,27 @@ actor Client {
     // and which events a retry may carry, is decided entirely by `drain()`.
     private var consecutiveFailures = 0
     private var nextAttemptAt: Date?
+    /// The retry ceiling, and the wider one a sustained outage earns. A minute is the right
+    /// cadence for a server that is briefly unwell. An outage that has already survived ten
+    /// attempts is not that, and retrying every 30 to 60 s for the length of it re-uploads the
+    /// same head slice over and over: an hour of 503s costs a foregrounded install 2.7 MB of
+    /// upload, 94% of it bytes already put on the wire, aimed at an ingest that is failing and
+    /// can least absorb the herd. Waiting longer loses nothing - the queue is on disk, `flush()`
+    /// and the flush on the way to the background both ignore the backoff entirely, and a track
+    /// or a presence ping re-arms the timer - so the install still looks at least once a cadence.
     private let maxBackoff: TimeInterval = 60
+    private let sustainedOutageBackoff: TimeInterval = 300
+    private let sustainedOutageAfter = 10
 
     // Session state. A session is "the app is in front of the user"; it survives short
     // interruptions and ends only after `sessionTimeout` of absence - the same gap the dashboard
     // uses, so the two agree on what a session is. Persisted so a quit-and-relaunch inside the
     // timeout continues the session and a relaunch after it starts a new one.
     private var isActive = false
+    /// The last foreground state the app reported, whatever this client did with it. `isActive`
+    /// moves only for a client that collects, and only on a change, so it is not a record of what
+    /// the app said; this is. nil means the app has reported nothing yet.
+    private var reportedActive: Bool?
     private var lastActiveAt: Date?
     private var lastHeartbeatAt: Date?
     /// The newest ping the server has acknowledged: seeded from the persisted stamp, moved only
@@ -111,8 +160,10 @@ actor Client {
     /// enough out that a ping which did land after all is not followed by a second tick in the
     /// same second; short enough that the sparsest cadence a plan asks for (240 s) plus one
     /// dropped ping still keeps the install inside the dashboard's five-minute presence window.
-    /// It is also the finest presence resolution `heartbeatInterval` itself allows.
-    private let minHeartbeatRetry: TimeInterval = 15
+    /// It is also the finest presence resolution `heartbeatInterval` itself allows. Injected
+    /// rather than read straight from here so a test can watch the replacement ping arrive
+    /// instead of spending fifteen seconds of real time on it; a shipped app takes the default.
+    private let minHeartbeatRetry: TimeInterval
     private var sessionID: String?
     /// True while `sessionID` is pre-minted and no `session.start` has been sent for it: the id
     /// exists so `install` and everything else recorded before the first foreground carry the
@@ -127,8 +178,14 @@ actor Client {
     private let lastEventKey: String
     private let heartbeatFloorKey: String
 
-    // User properties. The last snapshot the server has is mirrored here, so `identify` with the
-    // same values on every launch sends nothing; only a change costs an event.
+    // User properties. `traits` is the snapshot the server has ACKNOWLEDGED: it moves only when a
+    // batch carrying the `user.identify` (or `user.reset`) that changed it comes back accepted, so
+    // `identify` with the same values on every launch stays free while what it recorded is really
+    // stored, and starts sending again the moment a carrying event is lost. What an event still
+    // owed will leave the server with is read from the queue instead of being kept beside this,
+    // because the queue is the one place that knows whether that event still exists: a trim, a
+    // permanent 4xx, a dropped queue file and a relaunch all move it, and a second copy of the
+    // answer would disagree with the first. See `pendingTraits`.
     private var traits: [String: String]
     private let traitsKey: String
 
@@ -136,21 +193,42 @@ actor Client {
     private let isNewInstall: Bool
     private let installAt: Date
     private var installRecorded = false
+    /// Set while this install still owes its `install` event, and cleared the moment the event is
+    /// queued. The launch that mints the id is not always one that can record: the environment
+    /// gate excludes Debug and the Simulator by default, and an app waiting for consent
+    /// configures with `isEnabled: false`, so `track` is a no-op on both. `isNewInstall` is true
+    /// on that one launch only, so without a note on disk the event is owed by a launch that is
+    /// already over and is lost for the life of the install. Nothing written means nothing owed,
+    /// which is how every install set up by an earlier version reads: those were counted when
+    /// they were new.
+    private let installPendingKey: String
 
     /// Whether this build has anything to ask the store about. A compile-time environment
     /// (Simulator, Debug) has not, so the question is closed before it is opened. Injected rather
     /// than read directly so tests can drive the ask path at all: a test host is a Debug build,
     /// where it is never entered.
     private let asksTheStore: Bool
+    /// The ask itself, injected alongside `asksTheStore` and for the same reason: the real one
+    /// answers a test host instantly, so a wait a slow store is meant to bound has nothing to
+    /// bound there.
+    private let storeAnswer: @Sendable () async -> (answer: AppEnvironment?, failure: String?)
 
     init(
         config: AppGlance.Configuration, userID: String, isNewInstall: Bool = false, installAt: Date = Date(),
         session: URLSession = .shared, now: @escaping @Sendable () -> Date = { Date() },
-        asksTheStore: Bool = !AppEnvironment.isCompileTimeDetermined
+        asksTheStore: Bool = !AppEnvironment.isCompileTimeDetermined,
+        storeAnswer: @escaping @Sendable () async -> (answer: AppEnvironment?, failure: String?) = {
+            await AppEnvironment.storeAnswer()
+        },
+        environmentAnswerGrace: TimeInterval = 3,
+        minHeartbeatRetry: TimeInterval = 15
     ) {
         self.config = config
         self.session = session
         self.asksTheStore = asksTheStore
+        self.storeAnswer = storeAnswer
+        self.environmentAnswerGrace = environmentAnswerGrace
+        self.minHeartbeatRetry = minHeartbeatRetry
         self.userID = userID
         self.isNewInstall = isNewInstall
         self.installAt = installAt
@@ -164,6 +242,7 @@ actor Client {
         self.lastEventKey = "app.appglance.lastEvent.\(config.appID)"
         self.heartbeatFloorKey = "app.appglance.heartbeatFloor.\(config.appID)"
         self.traitsKey = "app.appglance.traits.\(config.appID)"
+        self.installPendingKey = "app.appglance.installPending.\(config.appID)"
         let defaults = UserDefaults.standard
         // A minted id means this device is not the one that state was written on. The install id
         // is device-bound (a `ThisDeviceOnly` Keychain item, mirrored outside the backup), but
@@ -179,25 +258,22 @@ actor Client {
             self.serverHeartbeatFloor = floor
         }
         let persistedSessionID = defaults.string(forKey: sessionKey)
-        var restoredLastActive: Date?
-        if let stamp = defaults.object(forKey: lastActiveKey) as? Double {
-            restoredLastActive = Date(timeIntervalSince1970: stamp)
-        }
+        let persistedUnadopted = defaults.bool(forKey: sessionUnadoptedKey)
+        self.startupSession = (persistedSessionID, persistedUnadopted)
+        let bootTime = now()
+        let restoredLastActive = Self.restoredStamp(defaults.object(forKey: lastActiveKey) as? Double, at: bootTime)
         // The heartbeat stamp survives a relaunch for the same reason the session does: the
         // interval is a wall-clock promise, at most one presence ping per heartbeatInterval,
         // and the server folds pings into additive rollups that a doubled tick would inflate.
-        if let beat = defaults.object(forKey: lastHeartbeatKey) as? Double {
-            self.lastHeartbeatAt = Date(timeIntervalSince1970: beat)
-        }
+        self.lastHeartbeatAt = Self.restoredStamp(defaults.object(forKey: lastHeartbeatKey) as? Double, at: bootTime)
         // A ping an earlier process stamped is the best proof of delivery this one can have: the
         // queue file never holds a ping that was in flight, so there is nothing left to re-send
         // either way. A roll-back therefore undoes only this process's own unconfirmed pings.
         self.deliveredHeartbeatAt = self.lastHeartbeatAt
         // The event stamp comes back with it: it is the other half of the silence the interval
         // measures, and a resumed session records no event of its own to replace it.
-        if let event = defaults.object(forKey: lastEventKey) as? Double {
-            self.lastEventAt = Date(timeIntervalSince1970: event)
-        }
+        self.lastEventAt = Self.restoredStamp(defaults.object(forKey: lastEventKey) as? Double, at: bootTime)
+        self.startupPresence = (self.lastHeartbeatAt, self.lastEventAt, restoredLastActive)
         self.traits = (defaults.dictionary(forKey: traitsKey) as? [String: String]) ?? [:]
 
         let environment = AppEnvironment.current
@@ -212,15 +288,12 @@ actor Client {
         // alone: the stamp keeps deciding resume vs new session exactly as it always has. A
         // client the gate has closed records nothing, so it mints nothing and writes nothing:
         // its own run must not renumber the session state a sending build left behind.
-        var gapExceedsTimeout = true
-        if let last = restoredLastActive, now().timeIntervalSince(last) <= config.sessionTimeout {
-            gapExceedsTimeout = false
-        }
+        let gapExceedsTimeout = Self.secondsSince(restoredLastActive, at: bootTime) > config.sessionTimeout
         var startupSessionID: String?
         if restoredLastActive != nil { startupSessionID = persistedSessionID }
         var startupUnadopted = false
         if collecting {
-            if defaults.bool(forKey: sessionUnadoptedKey), let preMinted = persistedSessionID, !preMinted.isEmpty {
+            if persistedUnadopted, let preMinted = persistedSessionID, !preMinted.isEmpty {
                 // A run that died between minting and its first foreground: the same id is still
                 // owed its `session.start`, so it is reused, never replaced.
                 startupSessionID = preMinted
@@ -275,12 +348,26 @@ actor Client {
         // an outage. A closed environment gate stops the queue being loaded; only a closed
         // consent switch destroys it.
         let persisted = collecting ? Self.loadPersisted(from: storeURL) : []
-        if !config.isEnabled { try? FileManager.default.removeItem(at: storeURL) }
+        if !config.isEnabled {
+            try? FileManager.default.removeItem(at: storeURL)
+            // The person goes with the events. `$email`, `$name` and `$id` are the only personal
+            // data the SDK puts on disk, they live in `UserDefaults` - inside the iCloud and the
+            // encrypted backup - and the one API that clears them, `reset()`, records nothing on
+            // a client that is not collecting, so an app that turns the switch off first can
+            // never reach them again. Keyed on `isEnabled` for the same reason the delete above
+            // is: a closed environment gate is not a withdrawal, and clearing on one would throw
+            // away the shipped build's record of what the server holds, from a build sharing its
+            // container. The install id itself stays: turning collection back on has to be the
+            // same install, not a new one.
+            defaults.removeObject(forKey: traitsKey)
+            self.traits = [:]
+        }
         self.storeURL = storeURL
         self.encoder = EventCoding.makeEncoder()
         self.environment = environment
         self.collecting = collecting
         self.queue = persisted
+        self.inheritedEventIDs = Set(persisted.map(\.event_id))
 
         Self.announce(
             config: config, environment: environment, collecting: collecting,
@@ -334,12 +421,45 @@ actor Client {
     // MARK: - Commands (called by the `AppGlance` facade)
 
     /// Records `install`, exactly once per install, ahead of everything else. The facade calls
-    /// this before applying any other command.
+    /// this before applying any other command, and `adoptEnvironment` calls it again when a gate
+    /// that was closed at startup opens.
+    ///
+    /// A launch that mints the install id and cannot record writes the debt down instead, and the
+    /// first launch that is collecting pays it, stamped with its own `configure`: the moment this
+    /// install can first be counted, and the moment the rest of that first batch belongs to. An
+    /// older stamp would date the install to a run the app asked to be left out of its numbers.
+    /// Only a launch that mints the id ever writes the marker, so an Xcode run over an installed
+    /// App Store copy leaves nothing behind and no install is ever recorded twice.
     func recordInstallIfNeeded() {
-        guard isNewInstall, !installRecorded else { return }
+        guard !installRecorded, !retired else { return }
+        let defaults = UserDefaults.standard
+        let owed = defaults.bool(forKey: installPendingKey)
+        guard isNewInstall || owed else { return }
+        guard collecting else {
+            // The facade asks again on every command; write only what is not already there.
+            if !owed { defaults.set(true, forKey: installPendingKey) }
+            return
+        }
         installRecorded = true
+        // Cleared before the event is queued, as the unadopted-session marker is: a death in
+        // between costs this install its `install`, where clearing it afterwards would record a
+        // second one on the next launch. One uncounted install beats one counted twice.
+        defaults.removeObject(forKey: installPendingKey)
         track(signal: Signal.install, metadata: nil, at: installAt)
     }
+
+    /// Where the app is, according to what it last reported to this client, or nil if it has
+    /// reported nothing. The facade reads it before `shutdown()` and hands it to the client that
+    /// takes this one's place.
+    ///
+    /// A `configure` in the middle of a visit - the documented way to apply a consent change -
+    /// is the one moment nothing reports the app's state: SwiftUI reports the front through
+    /// `onAppear` and through scene-phase *changes*, and a configure mid-visit is neither, while
+    /// a UIKit app's `setActive(_:)` calls come from those same two transitions. Without the
+    /// hand-over the replacement starts inactive and stays that way for the rest of the visit:
+    /// no `session.start`, no presence ping, no flush on the way to the background, and no
+    /// last-active stamp for the next launch to judge resume-or-new-session by.
+    func reportedForegroundState() -> Bool? { reportedActive }
 
     /// Stops the timers and retires the client: it records nothing further and, above all,
     /// never writes the queue file again - a later `configure` has replaced it, and the
@@ -357,14 +477,18 @@ actor Client {
         lifecycleCheckTask?.cancel()
         lifecycleCheckTask = nil
         queue.removeAll()
+        // A flush parked on the environment grace has nothing left to send: it is told so now
+        // rather than after sitting out the rest of the wait.
+        releaseEnvironmentWaiters()
     }
 
     /// Arms the missing-lifecycle check; the facade calls this once, right after `configure`.
     /// Separate from init so tests own exactly when (and whether) it runs, and so the delay can
     /// be shortened in a test rather than waited out.
     func armLifecycleCheck(after grace: TimeInterval? = nil) {
+        if let grace { lifecycleCheckGrace = grace }
         guard collecting, !retired, !sawLifecycleSignal, !lifecycleCheckDone, lifecycleCheckTask == nil else { return }
-        let wait = grace ?? lifecycleSignalGrace
+        let wait = lifecycleCheckGrace ?? lifecycleSignalGrace
         lifecycleCheckTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: Self.nanoseconds(wait))
             guard !Task.isCancelled else { return }
@@ -393,8 +517,9 @@ actor Client {
             return
         }
         environmentAsks += 1
+        let ask = storeAnswer
         refineTask = Task { [weak self] in
-            let (answer, failure) = await AppEnvironment.storeAnswer()
+            let (answer, failure) = await ask()
             await self?.adoptStoreAnswer(answer, failure: failure)
         }
     }
@@ -404,6 +529,9 @@ actor Client {
     /// stands for the rest of the run.
     func adoptStoreAnswer(_ answer: AppEnvironment?, failure: String? = nil) {
         refineTask = nil
+        // Whatever this ask settled - a corrected label, or the guess standing for the run - is
+        // what a flush parked on the grace is waiting for, so it goes on from here.
+        defer { releaseEnvironmentWaiters() }
         guard !retired else { return }
         guard let answer else {
             let again = environmentAsks < maxEnvironmentAsks
@@ -422,34 +550,94 @@ actor Client {
     /// Adopts the store's answer for where this build runs. Queued events carrying this run's
     /// guessed label are restamped - the first flush waits for the refinement, so nothing
     /// leaves with the wrong tag. Labels that differ from the guess are kept: they came from
-    /// an earlier run whose channel this process cannot vouch for. If the corrected
-    /// environment closes the sending gate, the queue is dropped - those events belong to an
-    /// environment the app said should never send.
+    /// an earlier run whose channel this process cannot vouch for.
+    ///
+    /// The answer can move the sending gate either way, and both directions have to arrive at
+    /// the state init would have set up had the guess been right from the start.
+    ///
+    /// - It opens. This client is the recording one now, so it takes the session state init
+    ///   withheld from it (`adoptStartupSession`) and reads the queue file init did not read.
+    /// - It closes. This client records nothing further and sends nothing, so everything it
+    ///   queued under the guess goes with the gate: those events belong to an environment the
+    ///   app said should never send. What was already on disk when this client started stays
+    ///   there. That is init's rule word for word - a closed environment gate is not a
+    ///   withdrawal of consent, and a debuggable build run over an installed release copy must
+    ///   not destroy the queue that copy saved during an outage - and it holds however late the
+    ///   answer arrives. The state this run shares with the builds beside it goes back the way it
+    ///   was found: the presence stamps, the session id and the marker that says a session is
+    ///   still owed its `session.start`. So does this run's own `install`, which no later launch
+    ///   could record in its place.
     func adoptEnvironment(_ refined: AppEnvironment) {
         guard !retired, refined != environment else { return }
         let guessed = environment.rawValue
         environment = refined
         let wasCollecting = collecting
         collecting = config.isEnabled && (config.debug || config.enabledEnvironments.contains(refined))
-        if !wasCollecting, collecting, sessionID == nil {
-            // The gate was closed when this client started, so it minted no session id then.
-            // Everything recorded from here to the first foreground still needs the id that
-            // `session.start` will adopt.
-            let minted = UUID().uuidString.lowercased()
-            sessionID = minted
-            sessionUnadopted = true
-            UserDefaults.standard.set(minted, forKey: sessionKey)
-            UserDefaults.standard.set(true, forKey: sessionUnadoptedKey)
-        }
-        queue = queue.map { $0.environment == guessed ? $0.relabeled(environment: refined.rawValue) : $0 }
-        if !collecting {
+        if collecting {
+            if !wasCollecting {
+                adoptStartupSession()
+                // The events an earlier run left owed are this client's to deliver now. They are
+                // read at the labels they carry and restamped below by the same rule as this
+                // run's own, and reading them is also what keeps the write below from putting an
+                // empty queue over a file this client had not looked at.
+                let waiting = Self.loadPersisted(from: storeURL)
+                inheritedEventIDs.formUnion(waiting.map(\.event_id))
+                queue = waiting + queue
+            }
+            // The slice on the wire is restamped with the queue, by the same rule. Those events
+            // are beyond recall as sent, but `persist` writes them as the crash record, and a
+            // next launch that never gets an answer of its own would deliver them under the
+            // guess: beta or development traffic landing in the dashboard's Live scope, which is
+            // the one thing the label exists to prevent.
+            inFlightBatch = inFlightBatch.map {
+                $0.environment == guessed ? $0.relabeled(environment: refined.rawValue) : $0
+            }
+            queue = queue.map { $0.environment == guessed ? $0.relabeled(environment: refined.rawValue) : $0 }
+            persist()
+            // The check the facade armed refused at the closed gate, and it is the one integration
+            // mistake a customer cannot debug from the console. A build gated out at startup and
+            // opened by the answer is exactly the shipping build where the mistake is live.
+            if !wasCollecting { armLifecycleCheck() }
+        } else {
+            // The slice on the wire is judged with the queue and by the same rule, minus its
+            // pings for the reason `persist` leaves them out, and it is read before the queue is
+            // emptied because a drain may have claimed the inherited events out of it already.
+            // A client that never read the file does not write it either, or a gate that was
+            // closed all along would truncate a queue it was never allowed to look at.
+            let inherited = owedEvents.filter { inheritedEventIDs.contains($0.event_id) }
+            // This run's own `install` is the one event the close cannot simply drop. Anything
+            // else the app records again the next time it happens; that one is owed by a launch
+            // already over, because `isNewInstall` is true on this launch alone and the marker
+            // was cleared the moment the event was queued. So the debt goes back on disk and the
+            // first launch that really collects pays it. Only a copy still in the queue is
+            // re-owed: one already claimed for the wire may yet be accepted, and a re-recorded
+            // install carries a fresh event id that the ingest's dedupe has nothing to collapse
+            // it against - one uncounted install beats one counted twice. An inherited copy is
+            // written back below and was never this run's to owe.
+            if installRecorded,
+                queue.contains(where: { $0.signal == Signal.install && !inheritedEventIDs.contains($0.event_id) })
+            {
+                installRecorded = false
+                UserDefaults.standard.set(true, forKey: installPendingKey)
+            }
             queue.removeAll()
+            inFlightBatch.removeAll()
+            if wasCollecting {
+                writeQueueFile(inherited)
+                // The events go and the stamps they moved go with them. `track` writes the
+                // last-event stamp on every call, and it is the install's, so a Release build run
+                // from Xcode over the App Store copy would otherwise leave the shipped build
+                // owing no presence ping for up to a whole interval on its next launch - four
+                // minutes of a real session missing from "active right now" at the cadence a
+                // free-plan account is asked for. This run was told it should never have been
+                // collecting, so it puts back what it found.
+                restoreStartupState()
+            }
             heartbeatTask?.cancel()
             heartbeatTask = nil
             flushTask?.cancel()
             flushTask = nil
         }
-        persist()
         if wasCollecting != collecting {
             // The announce line at configure spoke for the guess; say so when the answer differs.
             Log.line(
@@ -460,6 +648,81 @@ actor Client {
         } else {
             log("environment corrected: \(guessed) is really \(refined.rawValue)")
         }
+        // A gate that opens is the first moment this client can record anything, and an install
+        // minted behind a closed one is still owed its `install`.
+        if collecting, !wasCollecting { recordInstallIfNeeded() }
+    }
+
+    /// Puts the install's presence stamps and session state back where this client found them.
+    private func restoreStartupState() {
+        lastHeartbeatAt = startupPresence.heartbeat
+        deliveredHeartbeatAt = startupPresence.heartbeat
+        lastEventAt = startupPresence.event
+        lastActiveAt = startupPresence.active
+        Self.write(startupPresence.heartbeat, forKey: lastHeartbeatKey)
+        Self.write(startupPresence.event, forKey: lastEventKey)
+        Self.write(startupPresence.active, forKey: lastActiveKey)
+        // The session goes back with them, and the marker above all: a first foreground that
+        // adopts a pre-minted id clears it, and the events carrying that id are exactly the ones
+        // the close keeps on disk. Left cleared, the next launch of the sending build finds no
+        // session pending, mints over the top, and those events are filed under a session it
+        // never opens. An absent key is what "never happened" looks like for these two as well.
+        sessionID = startupSession.id
+        sessionUnadopted = startupSession.unadopted
+        let defaults = UserDefaults.standard
+        if let id = startupSession.id {
+            defaults.set(id, forKey: sessionKey)
+        } else {
+            defaults.removeObject(forKey: sessionKey)
+        }
+        if startupSession.unadopted {
+            defaults.set(true, forKey: sessionUnadoptedKey)
+        } else {
+            defaults.removeObject(forKey: sessionUnadoptedKey)
+        }
+    }
+
+    /// A stamp on disk, or no stamp at all: an absent key is what "never happened" looks like
+    /// everywhere else this file reads one.
+    nonisolated private static func write(_ stamp: Date?, forKey key: String) {
+        if let stamp {
+            UserDefaults.standard.set(stamp.timeIntervalSince1970, forKey: key)
+        } else {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+    }
+
+    /// Gives this client the startup session state init withheld from it, by init's own test.
+    ///
+    /// A client the gate has closed records nothing, so init mints no id for it and never looks
+    /// at the pre-mint marker: `sessionID` holds only what a previous run left behind, which can
+    /// be a session that ended days ago. The gate opening makes this a recording client, so the
+    /// question init answers for every collecting client is answered here, against the same
+    /// stored state and in the same order. The gap is judged now rather than at init, for the
+    /// reason `setActive` judges it there: it can have crossed the timeout since.
+    private func adoptStartupSession() {
+        let defaults = UserDefaults.standard
+        let persistedSessionID = defaults.string(forKey: sessionKey)
+        if defaults.bool(forKey: sessionUnadoptedKey), let preMinted = persistedSessionID, !preMinted.isEmpty {
+            // A run that died between minting and its first foreground: the same id is still
+            // owed its `session.start`, so it is reused, never replaced.
+            sessionID = preMinted
+            sessionUnadopted = true
+            return
+        }
+        var gapExceedsTimeout = true
+        if let last = lastActiveAt, now().timeIntervalSince(last) <= config.sessionTimeout {
+            gapExceedsTimeout = false
+        }
+        // A session that can still be resumed keeps its restored id and stays unmarked, so the
+        // first foreground resumes it instead of opening a second one. Anything else needs an id
+        // of its own, minted and marked before a single event can carry it.
+        guard gapExceedsTimeout || sessionID == nil else { return }
+        let minted = UUID().uuidString.lowercased()
+        sessionID = minted
+        sessionUnadopted = true
+        defaults.set(minted, forKey: sessionKey)
+        defaults.set(true, forKey: sessionUnadoptedKey)
     }
 
     /// `at` is when the app made the call - the facade stamps it before queueing - so events
@@ -495,7 +758,7 @@ actor Client {
         log("▸ \(signal)\(signal == Signal.heartbeat ? " (presence ping)" : "")" + (metadata.map { " \($0)" } ?? ""))
 
         if queue.count >= config.maxBatchSize {
-            Task { await self.flushAutomatically() }
+            requestFlush()
         } else {
             scheduleFlush()
         }
@@ -505,13 +768,18 @@ actor Client {
     /// change is sent - as `user.identify` whose metadata is the whole merged set, so the server
     /// stores it as-is. Keys are clamped to 40 characters and values to 200, the limits the
     /// ingest API applies, so what the SDK remembers is exactly what the server stored.
+    ///
+    /// "A change" is measured against what the server will hold once everything already owed has
+    /// landed, not against what it holds now: an identify made while an earlier one is still
+    /// queued or on the wire merges on top of that one and never re-sends it.
     func identify(_ patch: [String: String], at: Date? = nil) {
         guard collecting, !retired else { return }
-        var merged = traits
+        let known = pendingTraits ?? traits
+        var merged = known
         for (key, value) in patch {
-            let k = String(key.trimmingCharacters(in: .whitespacesAndNewlines).prefix(maxTraitKeyLength))
+            let k = Self.clamped(key, to: maxTraitKeyLength)
             guard !k.isEmpty else { continue }
-            let v = String(value.trimmingCharacters(in: .whitespacesAndNewlines).prefix(maxTraitValueLength))
+            let v = Self.clamped(value, to: maxTraitValueLength)
             if v.isEmpty { merged.removeValue(forKey: k) } else { merged[k] = v }
         }
         // The ingest API keeps at most 20 metadata keys per event; beyond that the extra properties
@@ -523,16 +791,24 @@ actor Client {
             }.prefix(maxTraits)
             merged = merged.filter { keep.contains($0.key) }
         }
-        guard merged != traits else { return }
-        traits = merged
-        persistTraits()
+        // The acknowledged snapshot is deliberately not touched here: it names what the server
+        // has, and this call's event has not been sent yet, let alone accepted. It moves in
+        // `noteDeliveredTraits` and nowhere else.
+        guard merged != known else { return }
         track(signal: Signal.identify, metadata: merged, at: at)
     }
 
     /// Forgets every property attached to this install (sign-out) and sends `user.reset` if
     /// there was anything to forget. The install id itself is untouched.
+    ///
+    /// The stored snapshot is cleared here rather than when the `user.reset` lands, and this is
+    /// the one place where clearing ahead of delivery is right. An empty snapshot suppresses
+    /// nothing: every later `identify` sends its whole set whatever became of the reset, and each
+    /// one replaces the stored set wholesale server-side. Holding the person's email and name on
+    /// disk until the server acknowledged the sign-out would keep them exactly where the sign-out
+    /// asked for them to be gone.
     func reset(at: Date? = nil) {
-        guard collecting, !retired, !traits.isEmpty else { return }
+        guard collecting, !retired, !(pendingTraits ?? traits).isEmpty else { return }
         traits = [:]
         persistTraits()
         track(signal: Signal.reset, metadata: nil, at: at)
@@ -544,10 +820,13 @@ actor Client {
     /// session, whether the app was cold-launched or resumed; inactive stops the heartbeat and
     /// flushes, holding the process open long enough for the send to finish.
     func setActive(_ active: Bool, at: Date? = nil) {
-        // Recorded before the guards: even a call the client has nothing to do with (a repeated
-        // "active", one made while the gate is closed) proves the app is reporting its lifecycle,
-        // which is all the missing-lifecycle check is asking about.
+        // Both are recorded before the guards, because what the app reports is a fact about the
+        // app and not about this client: a repeated "active", or one made while the gate is
+        // closed, still proves the app reports its lifecycle at all - which is all the
+        // missing-lifecycle check is asking about - and still says where the app is, which is
+        // what a client replacing this one has no other way to learn.
         sawLifecycleSignal = true
+        reportedActive = active
         lifecycleCheckTask?.cancel()
         lifecycleCheckTask = nil
         guard collecting, !retired, active != isActive else { return }
@@ -557,9 +836,8 @@ actor Client {
             // The gap is judged now, not at init: it can have crossed the timeout since. A
             // pre-minted id is never a resume candidate - nothing has opened its session yet.
             let resumes =
-                lastActiveAt.map {
-                    sessionID != nil && !sessionUnadopted && t.timeIntervalSince($0) <= config.sessionTimeout
-                } ?? false
+                sessionID != nil && !sessionUnadopted
+                && Self.secondsSince(lastActiveAt, at: t) <= config.sessionTimeout
             if !resumes {
                 if sessionUnadopted {
                     // Adopt the pre-minted id, exactly once: `install` and everything recorded
@@ -571,7 +849,13 @@ actor Client {
                     sessionUnadopted = false
                     UserDefaults.standard.removeObject(forKey: sessionUnadoptedKey)
                 } else {
-                    sessionID = UUID().uuidString.lowercased()
+                    // Written before the event that carries it, as the pre-minted id is: a death
+                    // in between would otherwise leave a `session.start` for an id nothing on
+                    // disk names, and the next launch inside the timeout would resume the id
+                    // before it and file the whole visit under a session it never opened.
+                    let minted = UUID().uuidString.lowercased()
+                    sessionID = minted
+                    UserDefaults.standard.set(minted, forKey: sessionKey)
                 }
                 track(signal: Signal.sessionStart, metadata: nil, at: t)
             }
@@ -585,7 +869,7 @@ actor Client {
             // the dashboard ends where the visit actually ended rather than at the last thing
             // that happened to be sent. Free at a one-minute cadence (the stamp is never that
             // old); one extra ping per silent visit at the sparser cadences a plan may ask for.
-            if t.timeIntervalSince(lastPresenceAt ?? .distantPast) > closingTickAfter {
+            if Self.secondsSince(lastPresenceAt, at: t) > closingTickAfter {
                 stampHeartbeat(t)
                 track(signal: Signal.heartbeat, metadata: nil, at: t)
                 log("· closing presence ping (quiet for over a minute)")
@@ -602,6 +886,62 @@ actor Client {
         lastActiveAt = t
         UserDefaults.standard.set(t.timeIntervalSince1970, forKey: lastActiveKey)
         UserDefaults.standard.set(sessionID, forKey: sessionKey)
+    }
+
+    /// Trimmed, then cut to `max` UTF-16 code units: the unit the ingest counts in, so what the
+    /// SDK remembers is what the server stored rather than something longer that the server then
+    /// cut again. `String.prefix` counts characters, which for anything outside the basic plane -
+    /// an emoji, a flag, most non-Latin scripts - is a different and larger number, and a
+    /// snapshot that can never match what was stored is one a repeat `identify` can never
+    /// correct. A cut that would split a surrogate pair drops the half rather than emitting a
+    /// lone one, which is what the ingest does with it anyway.
+    nonisolated private static func clamped(_ value: String, to max: Int) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let units = trimmed.utf16
+        guard units.count > max else { return trimmed }
+        var kept = Array(units.prefix(max))
+        if let last = kept.last, (0xD800...0xDBFF).contains(last) { kept.removeLast() }
+        return String(decoding: kept, as: UTF16.self)
+    }
+
+    /// The set the newest `user.identify` or `user.reset` still owed - queued or on the wire -
+    /// will leave the server with once it lands; nil when nothing is owed, in which case `traits`
+    /// is the whole truth. A `user.reset` owes the empty set, which is not the same answer as nil.
+    private var pendingTraits: [String: String]? {
+        Self.outstandingTraits(in: inFlightBatch + queue)
+    }
+
+    /// What the server ends up holding once every identify and reset in `owed` has landed: the
+    /// last one wins, exactly as it does server-side, where each `user.identify` replaces the
+    /// stored set wholesale and `user.reset` deletes it.
+    nonisolated private static func outstandingTraits(in owed: [Event]) -> [String: String]? {
+        guard let last = owed.last(where: { $0.signal == Signal.identify || $0.signal == Signal.reset })
+        else { return nil }
+        return last.signal == Signal.reset ? [:] : (last.metadata ?? [:])
+    }
+
+    /// Commits the snapshot a batch the server accepted has just left it holding. The only place
+    /// `traits` moves forward: what `identify` recorded is not what the server has until a batch
+    /// carrying it comes back accepted, and every way that event can die - the queue cap trimming
+    /// the oldest, a permanent 4xx dropping the slice, the file being replaced - then leaves the
+    /// snapshot where it was, so the next `identify` sends again instead of matching a cache the
+    /// server never received.
+    ///
+    /// `accepted` is the ingest's own count of the rows it took. A 2xx alone is not proof that
+    /// they were stored: past the plan's grace ceiling, and under the per-install rate limiter,
+    /// the answer is still 202 and the identify is discarded. A batch counted short of what was
+    /// sent commits nothing. nil is "the answer said nothing about it" - the Supabase backend
+    /// replies with no body at all - and is not a claim that anything was dropped.
+    ///
+    /// Nothing is committed while a NEWER identify or reset is still owed either: what the server
+    /// holds now is already superseded, and re-persisting it would put properties a sign-out has
+    /// just cleared back on disk. That one commits when its own batch lands.
+    private func noteDeliveredTraits(_ batch: [Event], accepted: Int?) {
+        if let accepted, accepted < batch.count { return }
+        guard let delivered = Self.outstandingTraits(in: batch) else { return }
+        guard pendingTraits == nil, delivered != traits else { return }
+        traits = delivered
+        persistTraits()
     }
 
     private func persistTraits() {
@@ -658,19 +998,54 @@ actor Client {
     }
 
     /// Seconds until the next ping is due: a full interval of silence after the last proof of
-    /// presence. Zero (or negative) means now - including the case where nothing has been sent
-    /// yet, such as a resumed session that started before this process.
+    /// presence. Zero means now - including the case where nothing has been sent yet, such as a
+    /// resumed session that started before this process. Never more than one interval, whatever
+    /// the stamps say: this number becomes a sleep the whole presence loop is paced by, and a
+    /// wait that outlives the visit is the same thing as no presence at all.
     private func timeUntilNextHeartbeat() -> TimeInterval {
-        guard let last = lastPresenceAt else { return 0 }
-        return heartbeatInterval - now().timeIntervalSince(last)
+        let t = now()
+        dropPresenceStampsAheadOf(t)
+        let silence = Self.secondsSince(lastPresenceAt, at: t)
+        return silence >= heartbeatInterval ? 0 : heartbeatInterval - silence
+    }
+
+    /// Forgets presence stamps that lie ahead of the clock. `restoredStamp` catches the ones an
+    /// earlier process wrote; this catches the ones this process wrote before the clock was
+    /// corrected backwards underneath it, which nothing at startup can see coming.
+    ///
+    /// It belongs here, where the cadence is decided, because this is the one place a stamp in
+    /// the future is not merely unusable but self-sustaining: the silence it measures never
+    /// grows, so a ping does not answer it and the loop would ask for another immediately, and
+    /// again, for as long as the app stayed in front. Presence is counted additively on the
+    /// server, so that flood would be permanent in the numbers. Dropping the stamp costs one
+    /// ping that was not owed and leaves the next one paced from it.
+    private func dropPresenceStampsAheadOf(_ t: Date) {
+        if let beat = lastHeartbeatAt, beat.timeIntervalSince(t) > Self.clockSkewTolerance {
+            lastHeartbeatAt = nil
+            UserDefaults.standard.removeObject(forKey: lastHeartbeatKey)
+        }
+        // With it, or the roll-back a dropped ping performs would restore the same bad stamp.
+        if let delivered = deliveredHeartbeatAt, delivered.timeIntervalSince(t) > Self.clockSkewTolerance {
+            deliveredHeartbeatAt = nil
+        }
+        if let event = lastEventAt, event.timeIntervalSince(t) > Self.clockSkewTolerance {
+            lastEventAt = nil
+            UserDefaults.standard.removeObject(forKey: lastEventKey)
+        }
     }
 
     /// Records a ping now. Returns false without ticking when the app is no longer active
     /// (`setActive(false)` cancels the heartbeat task on the actor; a tick that was already
-    /// waiting for its turn must not land after it).
+    /// waiting for its turn must not land after it), or when this client is no longer the one
+    /// collecting.
+    ///
+    /// `collecting` is tested here and not left to the `track` below, because the two stamps
+    /// above it are written first and they are the install's, shared by every build in the
+    /// container: a client the environment gate has closed would prove a presence the shipped
+    /// build has not proved, and move the stamp that build's next launch judges its session by.
     @discardableResult
     private func heartbeat() -> Bool {
-        guard isActive, !Task.isCancelled else { return false }
+        guard collecting, isActive, !Task.isCancelled else { return false }
         let t = now()
         stampHeartbeat(t)
         rememberActive(t)
@@ -713,6 +1088,13 @@ actor Client {
     /// read for, so proving it again is the right way round. `minHeartbeatRetry` keeps the two
     /// apart in the case where it was not.
     private func rollBackHeartbeatStamp(newestDropped: Date) {
+        // Nothing is re-armed on a client that is no longer sending. A store answer that closed
+        // the environment gate has already put the install's stamps back where this run found
+        // them, and the loop this would restart writes them once an interval for the rest of the
+        // visit on a client whose events go nowhere. `requeue` refuses for the same reason; the
+        // permanent-4xx branch drops its slice instead of putting it back, so it arrives here
+        // without passing through that guard.
+        guard collecting, !retired else { return }
         guard let current = lastHeartbeatAt, current <= newestDropped else { return }
         lastHeartbeatAt = deliveredHeartbeatAt
         if let restored = deliveredHeartbeatAt {
@@ -740,6 +1122,43 @@ actor Client {
         seconds.isFinite && seconds >= 15 && seconds <= 3600
     }
 
+    /// How far ahead of the clock a stamp may be and still be read as "now": the finest presence
+    /// resolution anything here has (`heartbeatInterval`'s floor, and `minHeartbeatRetry`). Below
+    /// it a skew is the distance between two clock reads - the facade stamps a call, the actor
+    /// applies it, a time server nudges the clock a fraction of a second - and changes nothing
+    /// anybody sees. Above it, a stamp in the future is a clock that was wrong when it was written.
+    private static let clockSkewTolerance: TimeInterval = 15
+
+    /// A persisted stamp, or nil when the number on disk cannot be one: not a finite moment, not
+    /// after 1970, or ahead of `t`. The presence stamps are this install's only record of when it
+    /// was last heard from, and a device whose clock was hours ahead when they were written leaves
+    /// every one of them in the future, where the silence they measure reads as negative and no
+    /// ping is ever due again. They get the same treatment as the server's cadence floor for the
+    /// same reason: a value that cannot be true is worth less than no value at all. Discarding one
+    /// costs this launch a ping it did not owe and a session boundary it did not need; keeping one
+    /// costs every ping until the clock catches up, on this launch and on all the ones after it.
+    nonisolated private static func restoredStamp(_ value: Double?, at t: Date) -> Date? {
+        guard let value, value.isFinite, value > 0,
+            value <= t.timeIntervalSince1970 + clockSkewTolerance
+        else { return nil }
+        return Date(timeIntervalSince1970: value)
+    }
+
+    /// How long ago `stamp` was, as of `t`, when that is a duration worth acting on:
+    /// `.greatestFiniteMagnitude` when there is no stamp at all, and when the stamp is ahead of
+    /// `t` by more than `clockSkewTolerance` - a clock corrected backwards under a stamp this
+    /// process itself wrote, which no check at startup can see coming.
+    ///
+    /// Every question the SDK asks of a stamp - resume this session or start a new one, is a ping
+    /// owed, does leaving deserve a closing tick - is safe when the answer is "a long time" and
+    /// stuck when it is "not yet", so a gap that cannot be measured reads as unbounded.
+    nonisolated private static func secondsSince(_ stamp: Date?, at t: Date) -> TimeInterval {
+        guard let stamp else { return .greatestFiniteMagnitude }
+        let elapsed = t.timeIntervalSince(stamp)
+        guard elapsed.isFinite, elapsed >= -clockSkewTolerance else { return .greatestFiniteMagnitude }
+        return max(0, elapsed)
+    }
+
     // MARK: - Flushing
 
     /// Seconds as a `Task.sleep` duration. Every wait in this file goes through here because the
@@ -750,6 +1169,18 @@ actor Client {
     nonisolated private static func nanoseconds(_ seconds: TimeInterval) -> UInt64 {
         guard seconds.isFinite, seconds > 0 else { return 0 }
         return UInt64(min(seconds, 3600) * 1_000_000_000)
+    }
+
+    /// The batch-size trigger's delivery, one outstanding at a time. See `flushRequested`.
+    private func requestFlush() {
+        guard !flushRequested else { return }
+        flushRequested = true
+        Task { await self.deliverRequestedBatch() }
+    }
+
+    private func deliverRequestedBatch() async {
+        await flushAutomatically()
+        flushRequested = false
     }
 
     private func scheduleFlush(after delay: TimeInterval? = nil) {
@@ -767,6 +1198,15 @@ actor Client {
     /// the remainder instead of touching the network. `flush()` itself never checks the
     /// backoff, so an explicit call and the on-the-way-to-background flush always attempt.
     func flushAutomatically() async {
+        // Joined before the backoff is read, not after. Whatever is delivering now sets the
+        // backoff as it finishes, so an attempt decided in front of it is decided against an
+        // answer that has not arrived: the timer fires while a request is out, sees no backoff,
+        // waits out the request inside `flush`, and then goes straight at a server that has since
+        // asked for room. `flush()` joins again, which is a no-op by then, and it still ignores
+        // the backoff itself, because an explicit call is the developer's own decision.
+        while let running = inFlight {
+            await running.value
+        }
         if let nextAttemptAt {
             let remaining = nextAttemptAt.timeIntervalSince(now())
             if remaining > 0 {
@@ -793,23 +1233,36 @@ actor Client {
     func flush() async {
         flushTask?.cancel()
         flushTask = nil
-        // The actor suspends inside `drain()`, so a second flush can arrive mid-send. It joins
-        // the send in progress instead of racing it - the slice was claimed out of the queue
-        // before the await, so nothing is ever sent twice, and a caller holding the process open
-        // stays until the send has landed.
+        // A delivery suspends the actor - for the store's label, and again for every request -
+        // so a second flush can arrive in the middle of one. It joins the delivery in progress
+        // instead of racing it: the task is claimed in the same actor step that found the slot
+        // free, with no await in between, so a second flush always finds it taken. One delivery
+        // at a time is what keeps `inFlightBatch` the record of the only slice on the wire; each
+        // slice being claimed out of the queue before its await is what keeps anything from
+        // being sent twice; and awaiting the task is what keeps a caller holding the process
+        // open there until the send has landed.
         while let running = inFlight {
             await running.value
         }
         // Nothing to label, nothing to send: an empty flush (the one after `setActive(false)`
         // when the previous flush already drained the queue, or an app calling `flush()` on a
-        // hunch) must not pay the wait below for a label no event is waiting on.
+        // hunch) must not pay the wait in `deliver` for a label no event is waiting on.
         guard collecting, !queue.isEmpty, !retired else { return }
+        let sending = Task { await self.deliver() }
+        inFlight = sending
+        await sending.value
+    }
+
+    /// One delivery: the brief wait for the store's label, then the drain. The wait belongs
+    /// inside the task `inFlight` holds rather than in front of it, because it is a suspension
+    /// like any other, and a flush suspended while the slot is still free is a flush the next
+    /// one does not join.
+    private func deliver() async {
+        defer { inFlight = nil }
         await awaitEnvironmentAnswer()
         // The answer can close the sending gate, and `adoptEnvironment` then drops the queue.
         guard collecting, !queue.isEmpty, !retired else { return }
-        let sending = Task { await self.drain() }
-        inFlight = sending
-        await sending.value
+        await drain()
     }
 
     /// Asks the store where this build runs, if the question is still open, and waits briefly for
@@ -818,37 +1271,65 @@ actor Client {
     /// the guess after the grace, and a late answer restamps whatever is still queued.
     private func awaitEnvironmentAnswer() async {
         beginEnvironmentRefinement()
-        guard let refineTask, !environmentGracePaid else { return }
+        guard refineTask != nil, !environmentGracePaid else { return }
         environmentGracePaid = true
-        let grace = environmentAnswerGrace
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { await refineTask.value }
-            group.addTask { try? await Task.sleep(nanoseconds: Self.nanoseconds(grace)) }
-            await group.next()
-            group.cancelAll()
+        // The wait is on a continuation the ask releases, not on the ask's own task. Awaiting a
+        // task's `value` is not a cancellation point, so a timer racing it inside a task group
+        // bounds nothing: a group returns only once every child has finished, and the child
+        // awaiting the ask finishes when the store does. `AppTransaction` has no timeout of its
+        // own, and the launch where it is slowest - one with no network - is exactly the launch
+        // whose batches must not be held behind it.
+        let timer = Task { [weak self, grace = environmentAnswerGrace] in
+            try? await Task.sleep(nanoseconds: Self.nanoseconds(grace))
+            guard !Task.isCancelled else { return }
+            await self?.releaseEnvironmentWaiters()
         }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            environmentWaiters.append(continuation)
+        }
+        timer.cancel()
     }
 
-    /// Sends the queue in request-sized slices, oldest first, until it is empty or the network
-    /// says "later". Each slice is claimed out of the queue before the await, so events tracked
-    /// meanwhile line up behind it.
+    /// Lets every flush parked on the environment grace go on: called when the ask settles, when
+    /// the grace runs out, and at shutdown. Whichever comes first releases them; the others find
+    /// nothing waiting.
+    private func releaseEnvironmentWaiters() {
+        let parked = environmentWaiters
+        environmentWaiters.removeAll()
+        for continuation in parked { continuation.resume() }
+    }
+
+    /// Sends the queue in request-sized slices, oldest first, until what it set out to send has
+    /// gone or the network says "later". Each slice is claimed out of the queue before the await,
+    /// so events tracked meanwhile line up behind it.
+    ///
+    /// What it sets out to send is what was owed when the delivery began, and that bound is what
+    /// keeps a burst from leaving as one request per event. The loop is fed by the same queue the
+    /// app is writing to, so an app recording as fast as the network answers - a screenful of
+    /// items, a replayed queue of user actions - has every iteration after the first find exactly
+    /// the one event tracked during the last round trip, and send it on its own: a full set of
+    /// request headers and a round trip each. Anything tracked after the delivery began goes with
+    /// the next one instead, which the batch-size trigger or the timer armed below asks for.
     private func drain() async {
-        defer { inFlight = nil }
         var slice = maxEventsPerRequest
-        while collecting, !queue.isEmpty, !retired {
-            let batch = Array(queue.prefix(slice))
+        var owed = queue.count
+        while collecting, owed > 0, !queue.isEmpty, !retired {
+            let batch = Array(queue.prefix(min(slice, owed)))
             queue.removeFirst(batch.count)
             inFlightBatch = batch
             persist()
             let count = "\(batch.count) event\(batch.count == 1 ? "" : "s")"
             log("↑ sending \(count)…")
             do {
-                try await send(batch)
+                let accepted = try await send(batch)
+                owed -= batch.count
                 inFlightBatch = []
                 persist()
                 consecutiveFailures = 0
                 nextAttemptAt = nil
                 noteDeliveredHeartbeats(batch)
+                // After the slice has left `inFlightBatch`, so "still owed" means what it says.
+                noteDeliveredTraits(batch, accepted: accepted)
                 log("✓ sent \(count)" + (environment == .simulator || environment == .debug ? " (scope: All)" : ""))
             } catch SendError.status(let status, _) where status == 413 && batch.count > 1 {
                 // Too big for one request: put it back and go smaller for the rest of this drain.
@@ -864,15 +1345,30 @@ actor Client {
                 log(
                     "✕ HTTP \(status) - \(status == 401 || status == 403 ? "check the write key (Setup tab in the dashboard); " : "")"
                         + "a retry could never succeed, so this batch is dropped")
+                owed -= batch.count
                 inFlightBatch = []
                 persist()
+                // The pings in it go too, and they were never counted: the ingest rejects a batch
+                // like this before it reads a row. Leaving their stamp in place would spend a
+                // whole fresh interval before the install proved presence again, which is the
+                // silence `rollBackHeartbeatStamp` exists to prevent - this branch simply never
+                // asked for it, because it drops the slice instead of putting it back.
+                if let newestDropped = batch.filter({ $0.signal == Signal.heartbeat }).map(\.client_ts).max() {
+                    rollBackHeartbeatStamp(newestDropped: newestDropped)
+                }
             } catch {
                 // Offline, 5xx, 429: keep everything, in order, for a later attempt.
                 let why: String
                 var retryAfter: TimeInterval?
                 if case SendError.status(let status, let after) = error {
                     why = "HTTP \(status)"
-                    if status == 429 { retryAfter = after }
+                    // Whatever the status said it. A maintenance window or a load shed answers
+                    // 503 and states how long to stay away, which is the case the header exists
+                    // for; 429 is the narrower one where this install alone is being throttled.
+                    // `obeyableRetryAfter` has already bounded the value, and `flush()` and the
+                    // flush on the way to the background ignore the backoff, so a header cannot
+                    // silence an install however it is set.
+                    retryAfter = after
                 } else {
                     why = error.localizedDescription
                 }
@@ -882,9 +1378,18 @@ actor Client {
                 log("⟳ couldn't send (\(why)) - keeping \(count) for a try in \(Int(delay.rounded()))s or on flush()")
                 inFlightBatch = []
                 requeue(batch, keepingHeartbeats: !Self.mayHaveBeenApplied(error))
+                // The retry is armed here rather than left to whatever the app does next. The
+                // batch-size trigger asks for one delivery at a time, so everything recorded
+                // behind this one has already been folded into it: an app that goes quiet after
+                // a burst would otherwise sit on a full queue until something else happened to it.
+                if !queue.isEmpty { scheduleFlush(after: delay) }
                 return
             }
         }
+        // Whatever was tracked while this delivery ran still needs a trigger of its own: the
+        // batch-size one is reached only by the next `track`, and this queue may already be past
+        // it. A timer is already armed here as often as not, and this is a no-op then.
+        if !queue.isEmpty { scheduleFlush() }
     }
 
     /// Puts a batch back at the front of the queue, ahead of anything queued meanwhile.
@@ -895,6 +1400,12 @@ actor Client {
     /// one is counted twice, permanently. A dropped tick costs a minute of resolution on a chart
     /// that is approximate by design; a doubled tick corrupts the numbers.
     private func requeue(_ batch: [Event], keepingHeartbeats: Bool) {
+        // Nothing goes back into a queue that is no longer being sent. A store answer that closed
+        // the environment gate while this batch was on the wire drops the batch with the rest:
+        // `adoptEnvironment` has already settled what stays on disk, and putting the slice back
+        // would stand events the gate closed on, pings included, in front of it. Retired is the
+        // same story from `shutdown`.
+        guard collecting, !retired else { return }
         let retryable = keepingHeartbeats ? batch : batch.filter { $0.signal != Signal.heartbeat }
         let dropped = batch.count - retryable.count
         if dropped > 0 {
@@ -944,10 +1455,13 @@ actor Client {
     }
 
     /// How long automatic delivery waits after the latest failure: exponential in the number of
-    /// consecutive failures, with jitter so a fleet of installs does not retry in lockstep,
-    /// capped at `maxBackoff`. A server-stated Retry-After is the floor, never shortened.
+    /// consecutive failures, with jitter so a fleet of installs does not retry in lockstep, capped
+    /// at `maxBackoff` and at `sustainedOutageBackoff` once the streak passes `sustainedOutageAfter`
+    /// - past that many attempts it is an outage rather than a blip, and the on-disk queue is the
+    /// better answer than a tight retry. A server-stated Retry-After is the floor, never shortened.
     private func backoffDelay(floor retryAfter: TimeInterval?) -> TimeInterval {
-        let exponential = min(maxBackoff, pow(2, Double(consecutiveFailures)))
+        let ceiling = consecutiveFailures > sustainedOutageAfter ? sustainedOutageBackoff : maxBackoff
+        let exponential = min(ceiling, pow(2, Double(consecutiveFailures)))
         return max(exponential * Double.random(in: 0.5...1), retryAfter ?? 0)
     }
 
@@ -956,6 +1470,26 @@ actor Client {
     /// Names the SDK and its version to the ingest, so an install still on an older release can
     /// be told from one that has updated.
     nonisolated static let userAgent = "AppGlance-Apple/\(AppGlance.version)"
+
+    /// Refuses to follow a redirect on the batch POST.
+    ///
+    /// `URLSession` follows them by default and re-applies the original request's headers to the
+    /// new one, so a `301` or a `302` would carry the write key - and whatever a `user.identify`
+    /// is holding, an email and a name - to whatever host the answer names, and a `2xx` from that
+    /// host would be read as the batch being delivered. The ingest does not redirect. The case
+    /// where one can appear is an app pointing `endpoint` at its own deployment, and there the
+    /// right answer is to fail and let the queue retry, not to follow a stranger. The Kotlin
+    /// transport refuses them too, so the two SDKs answer this the same way.
+    private final class RefusesRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+        func urlSession(
+            _ session: URLSession, task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest
+        ) async -> URLRequest? {
+            nil
+        }
+    }
+
+    private let redirectPolicy = RefusesRedirects()
 
     private enum SendError: Error {
         /// The status, and the server's numeric Retry-After in seconds when it sent one. The
@@ -978,15 +1512,28 @@ actor Client {
         return min(seconds, maxRetryAfter)
     }
 
-    private func send(_ batch: [Event]) async throws {
+    /// The longest a batch POST may take, kept under the ceiling `ProcessHold` waits for. The
+    /// flush on the way to the background and every explicit `flush()` run under that assertion,
+    /// and `URLSession.shared`'s own default is more than twice as long: a request still
+    /// outstanding when the assertion expires is one whose answer arrives at a suspended process,
+    /// so the batch is counted as failed and the whole slice is re-uploaded on the next launch -
+    /// exactly what the assertion is held to prevent. Failing inside the hold instead is a clean
+    /// failure: the backoff is recorded and the queue is already on disk. Set on the request
+    /// rather than through a session of the SDK's own, which would also cost the app's shared
+    /// connection pool. The Kotlin transport is bounded at 15 s connect plus 15 s read.
+    private static let requestTimeout: TimeInterval = 20
+
+    /// Returns the ingest's `accepted` count when the answer carries one, nil when it does not.
+    private func send(_ batch: [Event]) async throws -> Int? {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
+        request.timeoutInterval = Self.requestTimeout
         for (field, value) in headers {
             request.setValue(value, forHTTPHeaderField: field)
         }
         request.httpBody = try encoder.encode(batch)
 
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request, delegate: redirectPolicy)
         guard let http = response as? HTTPURLResponse else { throw SendError.status(-1, retryAfter: nil) }
         guard (200..<300).contains(http.statusCode) else {
             let stated = http.value(forHTTPHeaderField: "Retry-After")
@@ -997,6 +1544,20 @@ actor Client {
         // Supabase backend answers nothing (return=minimal). Anything unparseable is simply not
         // a hint - the batch was accepted either way.
         adoptHeartbeatFloor(Self.heartbeatFloor(in: data))
+        return Self.acceptedCount(in: data)
+    }
+
+    /// `accepted` from an ingest response body, if it carries one: how many of the rows sent the
+    /// server actually took. A batch can be answered 2xx and still be counted short - past the
+    /// plan's grace ceiling, or under the per-install rate limiter.
+    nonisolated private static func acceptedCount(in data: Data) -> Int? {
+        guard !data.isEmpty,
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let value = object["accepted"]
+        else { return nil }
+        if let number = value as? NSNumber { return number.intValue }
+        if let string = value as? String { return Int(string) }
+        return nil
     }
 
     /// `heartbeat_interval` from an ingest response body, if it carries one.
@@ -1012,15 +1573,73 @@ actor Client {
 
     // MARK: - Offline persistence
 
-    /// Writes what is still owed to disk: the queue, plus the in-flight slice's non-heartbeat
-    /// events. If the process is killed before the response arrives, the next launch re-sends
-    /// those (the server ignores replays by event id) and never the heartbeats, which may already
-    /// have been counted. Refused once retired, so a replaced client cannot clobber the file.
+    /// What the queue file says, as the events it holds rather than as the bytes that hold them:
+    /// `JSONEncoder` orders an object's keys differently from one call to the next, so two
+    /// encodings of the same events agree on everything a reload can see and almost never agree
+    /// byte for byte.
+    ///
+    /// A write of what the file already holds is skipped, because several of the calls into
+    /// `persist()` cannot change what is owed at all. Claiming a slice with no presence ping in
+    /// it moves events from `queue` into `inFlightBatch`, and the union of the two is what gets
+    /// written, so the file would come out saying exactly what it already says; handing that
+    /// same slice back after a transient failure moves them again, for the same answer. Each of
+    /// those pays a full atomic rewrite, which costs about as much for four hundred bytes as for
+    /// two hundred kilobytes, because what it buys is filesystem metadata rather than throughput.
+    ///
+    /// Only this client writes the file while it lives, so the record cannot go stale underneath
+    /// it: init reads the file, `shutdown()` retires the client, and a replacement is built only
+    /// after that. It is set by a write that reported success and dropped by one that threw.
+    private var lastWrittenQueue: [Event]?
+    /// The write itself, held as a function because the rule above - the record holds the bytes
+    /// that landed, never the bytes that were offered - only means anything against a store that
+    /// refuses one, and a real Caches directory cannot be made to refuse on demand.
+    private var saveQueueFile: @Sendable (Data, URL) throws -> Void = Client.atomicWrite
+    /// Through a temporary file the system renames into place, so a kill mid-write leaves the
+    /// queue file as it was rather than half of a new one.
+    private static let atomicWrite: @Sendable (Data, URL) throws -> Void = { data, url in
+        try data.write(to: url, options: .atomic)
+    }
+    /// Writes this client really made. Skipping a write and making the same one twice look alike
+    /// from the file, so a test needs to be told which happened.
+    private var queueFileWrites = 0
+
+    /// What is still owed: the queue, plus the in-flight slice's non-heartbeat events. If the
+    /// process is killed before the response arrives, the next launch re-sends those (the server
+    /// ignores replays by event id) and never the heartbeats, which may already have been counted.
+    private var owedEvents: [Event] {
+        inFlightBatch.filter { $0.signal != Signal.heartbeat } + queue
+    }
+
+    /// Saves what is owed. Refused once retired, so a replaced client cannot clobber the file,
+    /// and refused once the environment gate is closed: a client that is not collecting has
+    /// nothing of its own to save, and the file it would write over belongs to another build.
+    /// `adoptEnvironment` settles that file the moment the gate closes, and a send that was still
+    /// on the wire then must not undo it on the way back.
     private func persist() {
-        guard !retired else { return }
-        let owed = inFlightBatch.filter { $0.signal != Signal.heartbeat } + queue
-        guard let data = try? encoder.encode(owed) else { return }
-        try? data.write(to: storeURL, options: .atomic)
+        guard !retired, collecting else { return }
+        writeQueueFile(owedEvents)
+    }
+
+    /// The only writer of the queue file.
+    private func writeQueueFile(_ events: [Event]) {
+        // Judged before the encode, which is the expensive half at a deep queue, and against a
+        // file confirmed to still be there: Caches can be reclaimed at any moment, and a skip
+        // measured against a file the system has taken away would leave the queue nowhere at
+        // all. A `stat` is a microsecond or two against a write of the better part of a
+        // millisecond.
+        if events == lastWrittenQueue, FileManager.default.fileExists(atPath: storeURL.path) { return }
+        guard let data = try? encoder.encode(events) else { return }
+        do {
+            try saveQueueFile(data, storeURL)
+            lastWrittenQueue = events
+            queueFileWrites += 1
+        } catch {
+            // The record is only ever set by a write that reported success, so it still describes
+            // the file as far as anything here knows. It is dropped anyway: a write that failed
+            // may have disturbed the destination on its way out, and the next write is the one
+            // chance to put that right rather than skip it.
+            lastWrittenQueue = nil
+        }
     }
 
     nonisolated private static func loadPersisted(from url: URL) -> [Event] {
@@ -1041,11 +1660,30 @@ actor Client {
     /// Signals waiting for the next flush, in order.
     func pendingSignals() -> [String] { queue.map(\.signal) }
 
+    /// How many times this client has really written the queue file.
+    func queueFileWritesForTesting() -> Int { queueFileWrites }
+
+    /// Puts a store that refuses every write in place of the real one, or takes it away again:
+    /// the full disk, or the container the system has made read-only. The refused bytes never
+    /// reach `storeURL`, which keeps whatever it already held.
+    func refuseQueueWritesForTesting(_ refusing: Bool) {
+        if refusing {
+            saveQueueFile = { _, _ in throw CocoaError(.fileWriteOutOfSpace) }
+        } else {
+            saveQueueFile = Client.atomicWrite
+        }
+    }
+
     /// The queued events themselves, in order.
     func pendingEvents() -> [Event] { queue }
 
-    /// The user properties as the SDK believes the server has them.
-    func currentTraits() -> [String: String] { traits }
+    /// The user properties as they stand: what an identify or reset still owed will leave the
+    /// server with, or the acknowledged snapshot when nothing is owed.
+    func currentTraits() -> [String: String] { pendingTraits ?? traits }
+
+    /// The snapshot the server has acknowledged - what a repeat `identify` is measured against
+    /// once the queue is empty.
+    func deliveredTraits() -> [String: String] { traits }
 
     /// The current session id. Non-nil from init on: pre-minted whenever a fresh session is
     /// inevitable, restored when one can be resumed.
@@ -1054,12 +1692,35 @@ actor Client {
     /// Whether the current session id is a pre-minted one still waiting for its `session.start`.
     func currentSessionIsUnadopted() -> Bool { sessionUnadopted }
 
+    /// Whether this client believes the app is in front of the user.
+    func isActiveForTesting() -> Bool { isActive }
+
+    /// Whether a presence loop is armed. A client that is no longer collecting must not have
+    /// one: the stamps it writes are the install's, and every build sharing the container
+    /// reads them.
+    func presenceLoopIsArmedForTesting() -> Bool { heartbeatTask != nil }
+
+    /// One tick of the presence loop, asked for directly. The guards `heartbeat` applies are
+    /// defence in depth - every path that arms the loop is gated already, and every path that
+    /// closes the gate cancels it - so this is the only way to ask whether the innermost one
+    /// still holds.
+    @discardableResult
+    func heartbeatForTesting() -> Bool { heartbeat() }
+
     /// The presence cadence in force: the configured interval or the server's floor, whichever
     /// is larger.
     func heartbeatIntervalForTesting() -> TimeInterval { heartbeatInterval }
 
+    /// How long the presence loop is about to wait. Bounded by one interval whatever the stamps
+    /// say, which is the part a test can pin without waiting out a real sleep.
+    func timeUntilNextHeartbeatForTesting() -> TimeInterval { timeUntilNextHeartbeat() }
+
     /// Whether the missing-lifecycle line has been printed for this client.
     func reportedMissingLifecycleForTesting() -> Bool { lifecycleCheckDone }
+
+    /// Whether the app has reported a foreground transition to this client, which is what
+    /// decides whether the missing-lifecycle line can still be printed.
+    func sawLifecycleSignalForTesting() -> Bool { sawLifecycleSignal }
 
     /// How many times the store has been asked where this build runs, and whether an ask is open.
     func environmentAsksForTesting() -> Int { environmentAsks }
@@ -1071,7 +1732,7 @@ actor Client {
         (consecutiveFailures, nextAttemptAt)
     }
 
-    /// Forgets the persisted session state and user properties for an app id.
+    /// Forgets the persisted session state, the owed `install` and the user properties for an app id.
     nonisolated static func resetSessionState(appID: String) {
         UserDefaults.standard.removeObject(forKey: "app.appglance.lastActive.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.heartbeatFloor.\(appID)")
@@ -1079,6 +1740,7 @@ actor Client {
         UserDefaults.standard.removeObject(forKey: "app.appglance.sessionUnadopted.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.lastHeartbeat.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.lastEvent.\(appID)")
+        UserDefaults.standard.removeObject(forKey: "app.appglance.installPending.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.traits.\(appID)")
     }
 }

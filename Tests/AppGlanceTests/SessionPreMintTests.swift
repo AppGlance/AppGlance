@@ -144,6 +144,37 @@ final class SessionPreMintTests: XCTestCase {
             "everything, including the pre-foreground event, stays in the resumed session")
     }
 
+    /// A pre-minted id is never a resume candidate: nothing has opened its session yet, so there
+    /// is no `session.start` for a resume to continue. The state is ordinary - a recent last-active
+    /// stamp with no session key beside it, which is what a sibling build's late gate close leaves
+    /// behind - and a resume there means no `session.start` is ever sent for the visit, so the
+    /// whole thing files under a session the server never saw begin.
+    func testAPreMintedIDIsNotResumedEvenBesideARecentLastActiveStamp() async throws {
+        let id = "test.premint.recentstamp"; isolate(id)
+        let clock = TestClock()
+        // Recent enough to be inside the timeout, and no session id to go with it.
+        UserDefaults.standard.set(
+            clock.now.timeIntervalSince1970 - 30, forKey: "app.appglance.lastActive.\(id)")
+
+        let client = makeClient(appID: id, clock: clock)
+        let mintedID = await client.currentSessionID()
+        let preMinted = try XCTUnwrap(mintedID)
+        var unadopted = await client.currentSessionIsUnadopted()
+        XCTAssertTrue(
+            unadopted, "no session to restore, so one is minted here and is still owed its session.start")
+
+        await client.track(signal: "launch.option", metadata: nil)
+        await client.setActive(true)
+
+        let events = await client.pendingEvents()
+        XCTAssertEqual(
+            events.map(\.signal).filter { $0 != Signal.heartbeat }, ["launch.option", Signal.sessionStart],
+            "nothing has opened this session yet, so there is nothing for the foreground to resume")
+        XCTAssertEqual(Set(events.map(\.session_id)), [preMinted], "and the start adopts the id those events carry")
+        unadopted = await client.currentSessionIsUnadopted()
+        XCTAssertFalse(unadopted, "once, and only once")
+    }
+
     /// The full facade path: `configure` on a fresh install, launch-time calls, then the first
     /// foreground - one session id end to end, and install still first.
     func testConfigureToFirstForegroundCarriesOneSessionIDThroughTheFacade() async throws {

@@ -2,7 +2,7 @@ import Foundation
 
 /// One event, shaped as the ingest API and the events table see it - hence the snake_case
 /// names. `id` and `created_at` are assigned server-side.
-struct Event: Codable, Sendable {
+struct Event: Codable, Equatable, Sendable {
     /// Client-minted UUID. The server ignores a replay of the same `(app_id, event_id)`, which
     /// is what makes retrying a batch safe.
     let event_id: String

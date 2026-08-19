@@ -8,12 +8,19 @@ import XCTest
 final class SessionTests: XCTestCase {
 
     private func makeClient(
-        appID: String, clock: TestClock, sessionTimeout: TimeInterval = 300, heartbeatInterval: TimeInterval = 60
+        appID: String, clock: TestClock, sessionTimeout: TimeInterval = 300, heartbeatInterval: TimeInterval = 60,
+        storeAnswer: (@Sendable () async -> (answer: AppEnvironment?, failure: String?))? = nil,
+        environmentAnswerGrace: TimeInterval = 3, minHeartbeatRetry: TimeInterval = 15
     ) -> Client {
         Client(
             config: TestSupport.configuration(
                 appID: appID, sessionTimeout: sessionTimeout, heartbeatInterval: heartbeatInterval),
-            userID: "u-\(appID)", session: TestSupport.recordingSession(), now: { clock.now })
+            userID: "u-\(appID)", session: TestSupport.recordingSession(), now: { clock.now },
+            // A test that supplies an answer is a test that wants the ask path; a test host is a
+            // Debug build, where it is otherwise never entered.
+            asksTheStore: storeAnswer != nil,
+            storeAnswer: storeAnswer ?? { await AppEnvironment.storeAnswer() },
+            environmentAnswerGrace: environmentAnswerGrace, minHeartbeatRetry: minHeartbeatRetry)
     }
 
     /// Clean state before the test and again after it.
@@ -178,6 +185,36 @@ final class SessionTests: XCTestCase {
 
     /// The server may raise the cadence for the account's plan through the ingest response;
     /// the SDK obeys it as a floor, remembers it across launches, and ignores nonsense.
+    /// `setActive` is idempotent, and the doubled reports are the ones SwiftUI really produces:
+    /// `onAppear` then the first `scenePhase` on the way in, `.inactive` then `.background` on the
+    /// way out. Acting twice on one departure means two flushes, and - when the two halves are
+    /// more than a minute apart, which a slow background transition is - a second closing ping,
+    /// which is counted additively on the server and so lengthens the session permanently.
+    func testTheSameTransitionReportedTwiceIsActedOnOnce() async throws {
+        let id = "test.session.idempotent"; isolate(id)
+        let clock = TestClock()
+        let client = makeClient(appID: id, clock: clock)
+
+        await client.setActive(true)  // onAppear
+        await client.setActive(true)  // and the first scenePhase, the same fact again
+        clock.advance(90)  // a minute and a half with nothing sent
+        await client.setActive(false)  // .inactive: the closing ping goes with the flush
+        clock.advance(70)  // the transition takes its time
+        await client.setActive(false)  // .background: the same departure, reported again
+        await TestSupport.settle(0.4)
+
+        let starts =
+            RecordingProtocol.signals().filter { $0 == Signal.sessionStart }.count
+            + (await client.pendingSignals().filter { $0 == Signal.sessionStart }.count)
+        XCTAssertEqual(starts, 1, "two reports of arriving are one arrival")
+        let pings =
+            RecordingProtocol.signals().filter { $0 == Signal.heartbeat }.count
+            + (await client.pendingSignals().filter { $0 == Signal.heartbeat }.count)
+        XCTAssertEqual(pings, 1, "and two reports of leaving close the session once, however far apart they fall")
+        XCTAssertEqual(
+            RecordingProtocol.requestSizes().count, 1, "one departure, one flush, one process assertion")
+    }
+
     func testServerHeartbeatFloorIsHonouredRememberedAndBounded() async throws {
         let id = "test.session.floor"; isolate(id)
         let clock = TestClock()
@@ -337,33 +374,259 @@ final class SessionTests: XCTestCase {
 
     /// A ping the server never acknowledged must not pace the next one: the install would be
     /// silent for two intervals, which at the sparsest cadence a plan asks for is longer than the
-    /// dashboard's presence window.
-    func testADroppedPingDoesNotPaceTheNextOne() async throws {
+    /// dashboard's presence window. The replacement is owed to the visit that is still running,
+    /// so the stretch that lost the ping arms it - it is not left to whatever a later launch
+    /// happens to find on disk.
+    func testADroppedPingIsReplacedInsideTheSameVisit() async throws {
         let id = "test.session.droppedping"; isolate(id)
         let clock = TestClock()
+        // A minute of cadence, so the heartbeat task that has just ticked is asleep for a minute
+        // of real time: any ping this test sees came from the re-arm. The retry floor is
+        // shortened for the same reason - to be waited out rather than watched for.
+        let client = makeClient(appID: id, clock: clock, minHeartbeatRetry: 1)
 
-        let first = makeClient(appID: id, clock: clock)
-        await first.setActive(true)  // session.start at t0
+        await client.setActive(true)  // session.start at t0
         clock.advance(61)
-        let ticked = await TestSupport.waitForHeartbeats(1, from: first)
+        let ticked = await TestSupport.waitForHeartbeats(1, from: client)
         XCTAssertTrue(ticked, "the ping is due after a quiet minute")
 
         RecordingProtocol.script([500])
-        await first.flush()  // the ping is dropped rather than risk counting it twice
-        await TestSupport.settle(0.2)
+        await client.flush()  // the ping is dropped rather than risk counting it twice
         XCTAssertEqual(
             RecordingProtocol.signals().filter { $0 == Signal.heartbeat }.count, 0,
             "the server never saw that ping")
-        await first.setActive(false)
-        await first.shutdown()
+        await TestSupport.settle(0.25)
+        var pings = await client.pendingSignals().filter { $0 == Signal.heartbeat }.count
+        XCTAssertEqual(pings, 0, "not at once: the dropped ping may have landed after all")
 
-        // t+91: the app is opened again. The server's last proof of presence is still t0.
-        clock.advance(30)
-        RecordingProtocol.script([])
-        let second = makeClient(appID: id, clock: clock)
-        await second.setActive(true)
-        let proved = await TestSupport.waitForHeartbeats(1, from: second)
-        XCTAssertTrue(proved, "presence is owed from the last acknowledged ping, not from the dropped one")
+        // Same visit, same client: presence is owed from the last ping the server acknowledged,
+        // so the replacement arrives long before the fresh interval the dropped stamp would have
+        // bought - without a relaunch to load one from disk.
+        let replaced = await TestSupport.waitForHeartbeats(1, from: client)
+        XCTAssertTrue(replaced, "the stretch that lost the ping proves presence again itself")
+        pings = await client.pendingSignals().filter { $0 == Signal.heartbeat }.count
+        XCTAssertEqual(pings, 1, "one replacement, not a stream of them")
+    }
+
+    /// The roll-back goes back to the newest ping anyone has proof of, and a ping an earlier
+    /// process stamped is proof: the queue file never holds a ping that was in flight, so there is
+    /// nothing left to re-send either way and only this process's own unconfirmed pings are undone.
+    /// Forgetting it makes the install read as never having pinged, so a ping goes out at once and
+    /// the wall-clock promise - at most one per interval, across relaunches - is broken.
+    func testADroppedPingRollsBackOntoTheStampAnEarlierProcessLeft() async throws {
+        let id = "test.session.rollback.persisted"; isolate(id)
+        let clock = TestClock()
+        let defaults = UserDefaults.standard
+        let earlier = clock.now.timeIntervalSince1970 - 600
+        // A visit still inside the timeout, so this launch resumes and records no session.start of
+        // its own: the ping below is the only thing it sends.
+        defaults.set(clock.now.timeIntervalSince1970 - 30, forKey: "app.appglance.lastActive.\(id)")
+        defaults.set("22222222-2222-2222-2222-222222222222", forKey: "app.appglance.session.\(id)")
+        defaults.set(earlier, forKey: "app.appglance.lastHeartbeat.\(id)")
+
+        // A retry floor longer than the test, so the replacement ping cannot arrive and move the
+        // stamp this is about.
+        let client = makeClient(appID: id, clock: clock, minHeartbeatRetry: 600)
+        await client.setActive(true)
+        let ticked = await TestSupport.waitForHeartbeats(1, from: client)
+        XCTAssertTrue(ticked, "ten minutes of silence: a ping is owed at once")
+        XCTAssertEqual(
+            defaults.object(forKey: "app.appglance.lastHeartbeat.\(id)") as? Double,
+            clock.now.timeIntervalSince1970, "and queueing it stamps the install")
+
+        RecordingProtocol.script([500])
+        await client.flush()  // dropped rather than risk counting it twice
+
+        XCTAssertEqual(
+            defaults.object(forKey: "app.appglance.lastHeartbeat.\(id)") as? Double, earlier,
+            "so the next ping is paced from the last one the server acknowledged, which is the one on disk")
+        await client.shutdown()
+    }
+
+    /// The acknowledged stamp is dropped with the others when the clock steps behind them. Left
+    /// where it is, it is what the next dropped ping rolls back to, so a stamp from the future is
+    /// written straight back to disk and the ping-storm defence is undone for a whole round trip.
+    func testTheAcknowledgedPingStampIsDroppedWhenItTooIsAheadOfTheClock() async throws {
+        let id = "test.session.rollback.futuredelivered"; isolate(id)
+        let clock = TestClock()
+        let defaults = UserDefaults.standard
+        let client = makeClient(appID: id, clock: clock, heartbeatInterval: 0.2, minHeartbeatRetry: 600)
+
+        await client.setActive(true)  // session.start at t0
+        clock.advance(0.25)
+        let ticked = await TestSupport.waitForHeartbeats(1, from: client)
+        XCTAssertTrue(ticked, "quiet for an interval: a ping")
+        await client.flush()  // accepted, so the server has acknowledged a ping stamped at t0
+        XCTAssertEqual(RecordingProtocol.signals().filter { $0 == Signal.heartbeat }.count, 1)
+
+        clock.advance(-7200)  // corrected backwards, under both stamps at once
+        let again = await TestSupport.waitForHeartbeats(2, from: client)
+        XCTAssertTrue(again, "the stamps ahead of the clock are dropped, so presence is owed again")
+
+        // Leaving is what carries that ping, and the server drops it. Leaving also stops the loop,
+        // so nothing after this can move the stamp the assertion is about.
+        RecordingProtocol.script([500])
+        await client.setActive(false)
+        await TestSupport.settle(0.3)
+
+        XCTAssertNil(
+            defaults.object(forKey: "app.appglance.lastHeartbeat.\(id)"),
+            "the roll-back had no acknowledged ping to go back to: the one it was holding was in the future too")
+        await client.shutdown()
+    }
+
+    /// A stamp the clock has not reached yet: written while the device was hours ahead, read back
+    /// after the correction. The silence it measures reads as negative, so the next ping is due
+    /// hours out, and every relaunch reads the same stamp and owes the same nothing.
+    func testAPresenceStampFromTheFutureDoesNotSilenceTheLoop() async throws {
+        let id = "test.session.futurestamp"; isolate(id)
+        let clock = TestClock()
+        let now = clock.now.timeIntervalSince1970
+        let defaults = UserDefaults.standard
+        // A session that is still resumable, so this launch records no session.start of its own:
+        // a ping is then the only thing that can prove the install is in front of someone.
+        defaults.set(now - 30, forKey: "app.appglance.lastActive.\(id)")
+        defaults.set("11111111-1111-1111-1111-111111111111", forKey: "app.appglance.session.\(id)")
+        defaults.set(now - 600, forKey: "app.appglance.lastEvent.\(id)")
+        defaults.set(now + 7200, forKey: "app.appglance.lastHeartbeat.\(id)")
+
+        let client = makeClient(appID: id, clock: clock)
+        await client.setActive(true)
+        let proved = await TestSupport.waitForHeartbeats(1, from: client)
+        XCTAssertTrue(proved, "a stamp two hours ahead of the clock is not proof that anyone was here")
+        let queued = await client.pendingSignals()
+        XCTAssertEqual(
+            queued.filter { $0 == Signal.sessionStart }.count, 0,
+            "and the session on disk is still the one being lived")
+        await client.setActive(false)
+        await client.shutdown()
+    }
+
+    /// The same fault from inside one visit: a clock corrected backwards leaves the stamps this
+    /// process wrote ahead of it. The wait is what paces the whole presence loop, so it is bounded
+    /// by one interval however the arithmetic comes out.
+    func testAClockThatStepsBackwardsCannotStretchTheWait() async throws {
+        let id = "test.session.clockback"; isolate(id)
+        let clock = TestClock()
+        let client = makeClient(appID: id, clock: clock, heartbeatInterval: 60)
+        await client.setActive(true)  // session.start proves presence at t0
+        clock.advance(-7200)  // two hours backwards, mid-visit
+
+        let wait = await client.timeUntilNextHeartbeatForTesting()
+        XCTAssertGreaterThanOrEqual(wait, 0)
+        XCTAssertLessThanOrEqual(wait, 60, "the next ping is at most one interval out, never the whole offset")
+        await client.setActive(false)
+        await client.shutdown()
+    }
+
+    /// And the ping that answers it has to answer it. A stamp ahead of the clock measures a
+    /// silence that never grows, so a ping does not settle it: the loop would ask for another at
+    /// once, and again, for as long as the app stayed in front. Presence is counted additively on
+    /// the server, so a flood of pings is not a smaller error than a missing one, it is a larger
+    /// and a permanent one.
+    func testAClockThatStepsBackwardsDoesNotStartAPingStorm() async throws {
+        let id = "test.session.clockback.storm"; isolate(id)
+        let clock = TestClock()
+        let client = makeClient(appID: id, clock: clock, heartbeatInterval: 60)
+        await client.setActive(true)
+        clock.advance(-7200)
+
+        await TestSupport.settle(0.5)  // hundreds of pings fit in this, if the loop is not paced
+        let pings = await client.pendingSignals().filter { $0 == Signal.heartbeat }.count
+        XCTAssertLessThanOrEqual(pings, 1, "one ping proves presence again; the interval paces the next")
+        let wait = await client.timeUntilNextHeartbeatForTesting()
+        XCTAssertEqual(wait, 60, accuracy: 1, "and the loop is measuring from a stamp it can trust again")
+        await client.setActive(false)
+        await client.shutdown()
+    }
+
+    /// The other half of the same fault. A gap measured against a stamp the clock has stepped
+    /// behind comes out negative, and a negative gap is not a small one: it is a gap nothing can
+    /// measure. Every question the SDK asks of a stamp - resume this session or open a new one,
+    /// does leaving deserve a closing tick - is safe when the answer is "a long time" and stuck
+    /// when it is "no time at all": one endless session, and no session boundaries, for the life
+    /// of the bad stamp.
+    func testAGapThatCannotBeMeasuredReadsAsALongOneAndNotAsNone() async throws {
+        let id = "test.session.clockback.gap"; isolate(id)
+        let clock = TestClock()
+        // A minute of cadence, so the presence loop sleeps through the whole test in real time and
+        // the stamps it would judge are still there for the two questions below to be asked of.
+        let client = makeClient(appID: id, clock: clock, heartbeatInterval: 60)
+
+        await client.setActive(true)  // session.start at t0
+        await client.setActive(false)  // straight back out: no silence, so no closing ping
+        await TestSupport.settle(0.3)
+        clock.advance(-7200)  // the clock is corrected backwards while the app is away
+
+        await client.setActive(true)
+        await TestSupport.settle(0.2)
+        let starts =
+            RecordingProtocol.signals().filter { $0 == Signal.sessionStart }.count
+            + (await client.pendingSignals().filter { $0 == Signal.sessionStart }.count)
+        XCTAssertEqual(
+            starts, 2, "a last-active stamp two hours ahead cannot say this is still the same visit")
+
+        clock.advance(-7200)  // and again, under the stamps this stretch wrote
+        await client.setActive(false)
+        await TestSupport.settle(0.3)
+        let pings =
+            RecordingProtocol.signals().filter { $0 == Signal.heartbeat }.count
+            + (await client.pendingSignals().filter { $0 == Signal.heartbeat }.count)
+        XCTAssertEqual(
+            pings, 1, "and leaving still closes the session: a silence it cannot measure is a long one")
+        await client.shutdown()
+    }
+
+    /// The backoff a struggling server asks for is set by the delivery that is finishing, so an
+    /// automatic attempt has to read it after joining that delivery, not before. Reading it first
+    /// means the timer fires while a request is out, sees no backoff, waits out the request and
+    /// then goes straight at the server anyway.
+    func testAnAutomaticFlushReadsTheBackoffTheSendInProgressIsAboutToSet() async throws {
+        let id = "test.session.backoffrace"; isolate(id)
+        let client = makeClient(appID: id, clock: TestClock())
+        await client.track(signal: "a", metadata: nil)
+
+        RecordingProtocol.script([503])
+        let hold = RecordingProtocol.holdNextRequest()
+        let first = Task { await client.flushAutomatically() }
+        let started = await TestSupport.waitUntil { hold.isStarted }
+        XCTAssertTrue(started, "the first attempt is on the wire, and no backoff is set yet")
+
+        // The flush timer fires while that request is still out: today's window.
+        let second = Task { await client.flushAutomatically() }
+        hold.proceed()
+        await first.value
+        await second.value
+
+        let backoff = await client.backoffForTesting()
+        XCTAssertEqual(backoff.failures, 1, "one failure, from one attempt")
+        XCTAssertNotNil(backoff.nextAttemptAt)
+        XCTAssertEqual(
+            RecordingProtocol.requestSizes().count, 1,
+            "the second attempt saw the backoff the first had just set and waited, rather than retrying inside it")
+    }
+
+    /// A permanent 4xx drops the whole slice, pings included, and the ingest rejects a batch like
+    /// that before it reads a row - so those pings were never counted. Leaving their stamp in
+    /// place spends a whole fresh interval before the install proves presence again, which at the
+    /// cadence a free-plan account is asked for is longer than the dashboard's presence window.
+    func testAPermanentRejectionDoesNotPaceTheNextPingFromPingsItThrewAway() async throws {
+        let id = "test.session.4xxping"; isolate(id)
+        let clock = TestClock()
+        let client = makeClient(appID: id, clock: clock, minHeartbeatRetry: 1)
+        await client.setActive(true)  // session.start at t0
+        clock.advance(61)
+        let ticked = await TestSupport.waitForHeartbeats(1, from: client)
+        XCTAssertTrue(ticked, "the ping is due after a quiet minute")
+
+        RecordingProtocol.script([400])  // rejected before a single row is read
+        await client.flush()
+        XCTAssertEqual(
+            RecordingProtocol.signals().filter { $0 == Signal.heartbeat }.count, 0,
+            "the server never saw that ping")
+
+        let replaced = await TestSupport.waitForHeartbeats(1, from: client)
+        XCTAssertTrue(replaced, "so presence is still owed, measured from the last ping that was acknowledged")
     }
 
     // MARK: - Delivery
@@ -389,6 +652,85 @@ final class SessionTests: XCTestCase {
         _ = await (f1, f2)
         XCTAssertEqual(RecordingProtocol.signals(), ["a", "b"])
         XCTAssertEqual(RecordingProtocol.requestSizes(), [2], "one request, not two")
+    }
+
+    /// Two flushes that overlap the wait for the store's label. `inFlightBatch` is one slot -
+    /// the record `persist()` writes of what is on the wire - so a second drain starting while
+    /// the first slice is still out would put its own slice there, and the first slice would be
+    /// in neither the queue nor the file the next launch reads. The second flush joins the first.
+    func testASecondFlushJoinsTheOneWaitingForTheStoreRatherThanDrainingPastIt() async throws {
+        let id = "test.session.doubledrain"; isolate(id)
+        let store = StoreAnswerGate()
+        addTeardownBlock { store.answer(nil) }  // never leave the injected ask blocked
+        let client = makeClient(appID: id, clock: TestClock(), storeAnswer: { await store.ask() })
+        for i in 0..<150 { await client.track(signal: "e\(i)", metadata: nil) }
+
+        // The first request is held open, so "a slice is on the wire" is a moment the test can
+        // stop in and read the disk.
+        let hold = RecordingProtocol.holdNextRequest()
+        let first = Task { await client.flush() }
+        let asked = await store.waitUntilAsked()
+        XCTAssertTrue(asked, "the first flush is waiting for the label")
+
+        let second = Task { await client.flush() }
+        await TestSupport.settle(0.3)
+        XCTAssertFalse(
+            hold.isStarted, "nothing may go on the wire while the label the first flush is waiting for is unsettled")
+
+        store.answer(.testFlight)
+        await TestSupport.settle(0.3)  // long enough for a second drain to have claimed a slice
+        XCTAssertEqual(
+            try TestSupport.persistedSignals(id).count, 150,
+            "one slice on the wire and the rest queued: every event is still accounted for on disk")
+
+        hold.proceed()
+        await first.value
+        await second.value
+        XCTAssertEqual(RecordingProtocol.requestSizes(), [100, 50], "one drain in slices, not two drains")
+        XCTAssertEqual(RecordingProtocol.signals(), (0..<150).map { "e\($0)" }, "everything, once, in order")
+        XCTAssertEqual(try TestSupport.persistedSignals(id), [], "and nothing is owed")
+    }
+
+    /// The grace has to bound the wait for the label. Awaiting the ask's task is not a
+    /// cancellation point, so a timer racing it inside a task group cannot end the wait: the
+    /// group waits for the store however long it takes, and the launch where `AppTransaction` is
+    /// slowest - one with no network - is exactly the launch whose first batch must not be held.
+    func testAStoreThatNeverAnswersHoldsAFlushForTheGraceAndNoLonger() async throws {
+        let id = "test.session.grace"; isolate(id)
+        let store = StoreAnswerGate()  // asked, and never answered
+        addTeardownBlock { store.answer(nil) }
+        let client = makeClient(
+            appID: id, clock: TestClock(), storeAnswer: { await store.ask() }, environmentAnswerGrace: 0.3)
+        await client.track(signal: "a", metadata: nil)
+
+        let flushing = Task { await client.flush() }
+        let sent = await TestSupport.waitUntil(timeout: 3) { RecordingProtocol.signals() == ["a"] }
+        XCTAssertTrue(sent, "the grace runs out and the batch leaves with the guessed label")
+
+        store.answer(nil)  // whether or not the grace already released it, leave nothing blocked
+        await flushing.value
+    }
+
+    /// A redirect on the batch POST is refused, not followed. `URLSession` follows one by default
+    /// and re-applies the original headers to the new request, so the write key and whatever a
+    /// `user.identify` is carrying would go to whatever host the answer names, and a `2xx` from
+    /// there would be read as the batch being delivered - the events gone, and the customer's
+    /// key and their user's email in a stranger's log.
+    func testARedirectIsRefusedRatherThanFollowedWithTheWriteKey() async throws {
+        let id = "test.session.redirect"; isolate(id)
+        let client = makeClient(appID: id, clock: TestClock())
+        await client.identify([UserProperty.email: "ada@example.com"])
+
+        let elsewhere = URL(string: "https://somewhere-else.invalid/v1/events")!
+        RecordingProtocol.scriptRedirect(to: elsewhere)
+        await client.flush()
+
+        let hosts = RecordingProtocol.receivedRequests().compactMap { $0.url?.host }
+        XCTAssertEqual(
+            hosts, ["ingest.invalid"], "the key and the payload went to the configured host and nowhere else")
+        XCTAssertEqual(RecordingProtocol.signals(), [], "and nothing was counted as delivered")
+        let queued = await client.pendingSignals()
+        XCTAssertEqual(queued, [Signal.identify], "the batch is kept for a later attempt, as any other failure is")
     }
 
     func testLongQueueDrainsInSlicesAndKeepsOrder() async throws {
@@ -437,6 +779,101 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(try TestSupport.persistedSignals(id), ["x"], "on disk before any flush - a crash cannot lose it")
         await client.flush()
         XCTAssertEqual(try TestSupport.persistedSignals(id), [], "and gone from disk once acknowledged")
+    }
+
+    /// A delivery that fails and comes back has changed nothing about what is owed: the slice
+    /// moved from the queue into the in-flight slot and back, and the file holds the union of the
+    /// two. The client skips a write whose bytes match the one it last landed, so those two full
+    /// rewrites cost nothing - but only while the file still says what it is supposed to say,
+    /// which is what the content assertions here are for.
+    func testASliceWithNoPresencePingIsClaimedAndReturnedWithoutRewritingTheFile() async throws {
+        let id = "test.session.elide"; isolate(id)
+        let client = makeClient(appID: id, clock: TestClock())
+        await client.track(signal: "a", metadata: nil)
+        await client.track(signal: "b", metadata: nil)
+        let afterTracking = await client.queueFileWritesForTesting()
+        XCTAssertEqual(afterTracking, 2, "one write per tracked event, whatever else is elided")
+
+        RecordingProtocol.script([503])
+        await client.flush()
+        let afterFailure = await client.queueFileWritesForTesting()
+        XCTAssertEqual(
+            afterFailure, afterTracking,
+            "claimed and handed back with no ping in the slice: the file already owed exactly these two")
+        XCTAssertEqual(try TestSupport.persistedSignals(id), ["a", "b"], "and it still says so")
+
+        await client.flush()  // 202 this time
+        let afterAcknowledgement = await client.queueFileWritesForTesting()
+        XCTAssertEqual(afterAcknowledgement, afterTracking + 1, "the acknowledgement is a change, so it is written")
+        XCTAssertEqual(try TestSupport.persistedSignals(id), [])
+    }
+
+    /// The write the elision must never skip. Claiming a slice that carries a ping takes that
+    /// ping off disk, and it has to be gone before the request leaves: the server folds pings
+    /// additively and never dedupes, so one recovered by the next launch is counted twice.
+    func testClaimingASliceThatCarriesAPingStillRewritesTheFile() async throws {
+        let id = "test.session.elide.ping"; isolate(id)
+        let client = makeClient(appID: id, clock: TestClock())
+        await client.track(signal: Signal.heartbeat, metadata: nil)
+        await client.track(signal: "purchase", metadata: nil)
+        let beforeSend = await client.queueFileWritesForTesting()
+
+        let hold = RecordingProtocol.holdNextRequest()
+        let flushing = Task { await client.flush() }
+        while !hold.isStarted { await TestSupport.settle(0.02) }
+        XCTAssertEqual(
+            try TestSupport.persistedSignals(id), ["purchase"], "the ping is off disk before it is on the wire")
+        let inFlightWrites = await client.queueFileWritesForTesting()
+        XCTAssertGreaterThan(inFlightWrites, beforeSend, "which takes a write, however the bytes compare")
+
+        hold.proceed()
+        await flushing.value
+        XCTAssertEqual(RecordingProtocol.signals(), [Signal.heartbeat, "purchase"])
+        XCTAssertEqual(try TestSupport.persistedSignals(id), [])
+    }
+
+    /// The queue file lives in Caches, which the system may reclaim at any moment. A write is
+    /// skipped only against a file that is still there, or a client that had just been asked to
+    /// write what it wrote last would leave the queue nowhere at all.
+    func testAnIdenticalWriteIsNotSkippedWhenTheFileHasBeenReclaimed() async throws {
+        let id = "test.session.elide.reclaimed"; isolate(id)
+        let client = makeClient(appID: id, clock: TestClock())
+        await client.track(signal: "a", metadata: nil)
+        try FileManager.default.removeItem(at: Client.makeStoreURL(appID: id))
+
+        // Claimed and handed straight back, for bytes identical to the ones last written.
+        RecordingProtocol.script([503])
+        await client.flush()
+
+        XCTAssertEqual(
+            try TestSupport.persistedSignals(id), ["a"], "the event is owed, so something on disk has to say so")
+    }
+
+    /// The elision remembers what LANDED, not what was offered. A store that refuses a write and
+    /// says so must not leave the client believing the file holds those bytes, because the write
+    /// that follows is very often the identical one: claiming a slice and handing it back both
+    /// write the union of the queue and the in-flight batch, which is the same set. Skipping that
+    /// one against a file that never received it leaves the disk a whole event behind the client,
+    /// and a kill in between loses it - the one way this saving could cost events.
+    func testAQueueWriteThatDidNotLandIsNotRememberedAsThoughItHad() async throws {
+        let id = "test.session.elide.refused"; isolate(id)
+        let client = makeClient(appID: id, clock: TestClock())
+        await client.track(signal: "a", metadata: nil)
+        XCTAssertEqual(try TestSupport.persistedSignals(id), ["a"], "the first write is on disk")
+
+        await client.refuseQueueWritesForTesting(true)
+        await client.track(signal: "b", metadata: nil)
+        XCTAssertEqual(try TestSupport.persistedSignals(id), ["a"], "the refused write left the file as it was")
+
+        // The disk frees up, and the next write carries exactly the bytes the refused one did:
+        // claiming a slice with no ping in it and handing it back is the commonest write there is.
+        await client.refuseQueueWritesForTesting(false)
+        RecordingProtocol.script([503])
+        await client.flush()
+
+        XCTAssertEqual(
+            try TestSupport.persistedSignals(id), ["a", "b"],
+            "the write the elision would have skipped is the one that repairs the file")
     }
 
     // MARK: - Presence pings are never risked twice
@@ -518,13 +955,114 @@ final class SessionTests: XCTestCase {
         hold.proceed()
         await flushing.value
         XCTAssertEqual(
-            RecordingProtocol.requestSizes(), [2, 1], "the held slice carried both; the later event followed")
+            RecordingProtocol.requestSizes(), [2],
+            "the held slice carried both; a delivery sends what was owed when it began and no more")
+        XCTAssertEqual(
+            try TestSupport.persistedSignals(id), ["later"],
+            "and the event tracked while it was on the wire is still owed, waiting for the next one")
+
+        await client.flush()
+        XCTAssertEqual(RecordingProtocol.requestSizes(), [2, 1], "which the next delivery carries")
         XCTAssertEqual(RecordingProtocol.signals(), [Signal.heartbeat, "purchase", "later"])
         XCTAssertEqual(try TestSupport.persistedSignals(id), [], "acknowledged: nothing is owed")
     }
 
     /// A later `configure` replaces the client. The old one must stop recording and, above all,
     /// stop writing the queue file the replacement now owns.
+    /// The queue cap. An install offline for a long stretch keeps recording, and `persist()`
+    /// rewrites the whole array on every single `track`, so an uncapped queue costs memory and
+    /// battery in proportion to its own square and grows the file in Caches until the write fails
+    /// or the system reclaims it, taking everything with it. Five hundred events, and it is the
+    /// oldest that go: the newest are the ones still worth sending.
+    func testTheQueueIsHardCappedAndTheOldestGoFirst() async throws {
+        let id = "test.session.cap"; isolate(id)
+        let client = makeClient(appID: id, clock: TestClock())
+        // The outage itself. `maxBatchSize` cannot be set above the cap, so a queue at the cap is
+        // always one the batch-size trigger has just tried to send; the failure returns the slice
+        // and the frozen clock keeps the backoff from letting a second attempt through.
+        RecordingProtocol.script(Array(repeating: 503, count: 10))
+        for i in 0..<520 { await client.track(signal: "e\(i)", metadata: nil) }
+        await TestSupport.settle(0.4)
+
+        let queued = await client.pendingSignals()
+        XCTAssertEqual(queued.count, 500, "the cap holds however long the outage lasts")
+        XCTAssertEqual(queued.first, "e20", "and it is the oldest twenty that went")
+        XCTAssertEqual(queued.last, "e519", "so what is kept is the most recent five hundred")
+        XCTAssertEqual(
+            try TestSupport.persistedSignals(id).count, 500, "and the file a relaunch reads is capped with it")
+    }
+
+    /// A slice that comes back goes in front of everything recorded while it was away, which can
+    /// stand the queue over the cap. Only `track` would trim it otherwise: an app that records
+    /// rarely but flushes on a timer sits above the cap for as long as the outage lasts, and
+    /// `persist()` writes the oversized array to disk every time it is asked to.
+    func testARequeuedSliceIsTrimmedBackToTheCap() async throws {
+        let id = "test.session.cap.requeue"; isolate(id)
+        let client = makeClient(appID: id, clock: TestClock())
+        RecordingProtocol.script(Array(repeating: 503, count: 10))
+        let hold = RecordingProtocol.holdNextRequest()
+        // The batch-size trigger fires as the queue reaches the cap, and the recorder holds that
+        // request open while the app keeps recording behind it.
+        for i in 0..<500 { await client.track(signal: "e\(i)", metadata: nil) }
+        let started = await TestSupport.waitUntil { hold.isStarted }
+        XCTAssertTrue(started, "the first hundred are on the wire, four hundred still queued behind them")
+        for i in 0..<20 { await client.track(signal: "late\(i)", metadata: nil) }
+        hold.proceed()
+        await TestSupport.settle(0.4)
+
+        let queued = await client.pendingSignals()
+        XCTAssertEqual(
+            queued.count, 500, "the slice went back in front of the twenty tracked meanwhile, and the cap held")
+        XCTAssertEqual(queued.first, "e20", "the oldest of what came back is what the cap dropped")
+        XCTAssertEqual(queued.last, "late19", "and nothing recorded during the outage was lost to make room")
+        XCTAssertEqual(try TestSupport.persistedSignals(id).count, 500, "the file was never written oversized")
+    }
+
+    /// A burst - a screenful of items, a replayed queue of user actions, anything recorded faster
+    /// than one request round trip - has to leave as batches. Every event past `maxBatchSize`
+    /// reaches the batch-size trigger again, and the drain is fed by the same queue the app is
+    /// writing to: uncoalesced and unbounded, the two together turn a burst into one request per
+    /// event, each paying its own round trip and its own full set of headers, and the ingest sees
+    /// a rate-limitable storm from one install.
+    func testABurstOfEventsLeavesInBatchesAndNotOneRequestPerEvent() async throws {
+        let id = "test.session.burst"; isolate(id)
+        let client = Client(
+            config: TestSupport.configuration(appID: id, maxBatchSize: 20),
+            userID: "u-\(id)", session: TestSupport.recordingSession())
+
+        for i in 0..<200 { await client.track(signal: "e\(i)", metadata: nil) }
+        await TestSupport.settle(0.2)
+        await client.flush()  // the tail, which is otherwise the flush timer's
+
+        let sizes = RecordingProtocol.requestSizes()
+        XCTAssertEqual(RecordingProtocol.signals().count, 200, "everything arrives")
+        XCTAssertLessThanOrEqual(
+            sizes.count, 20, "two hundred events in twenty-event batches is a dozen requests, not two hundred")
+        XCTAssertEqual(sizes.filter { $0 == 1 }.count, 0, "and no request carries a single event")
+        XCTAssertTrue(
+            sizes.dropLast().allSatisfy { $0 >= 20 },
+            "every request but the last carries a full batch: what is recorded while one is on the wire rides"
+                + " along in the next, rather than each event asking for a delivery of its own")
+    }
+
+    /// The flush on the way to the background and every explicit `flush()` run under a process
+    /// assertion, and that assertion has a ceiling. A request allowed to outlive it is answered
+    /// into a suspended process: the batch is counted as failed and the whole slice is re-uploaded
+    /// on the next launch, which is exactly the replay the assertion is held to prevent.
+    func testABatchRequestCannotOutliveTheProcessAssertionHeldForIt() async throws {
+        let id = "test.session.timeout"; isolate(id)
+        let client = makeClient(appID: id, clock: TestClock())
+        await client.track(signal: "a", metadata: nil)
+        await client.flush()
+
+        let request = try XCTUnwrap(RecordingProtocol.receivedRequests().first)
+        XCTAssertLessThanOrEqual(
+            request.timeoutInterval, ProcessHold.maximumHold,
+            "a request the hold cannot outlast is one whose answer arrives at a process that is gone")
+        XCTAssertGreaterThanOrEqual(
+            request.timeoutInterval, 10, "and not so tight that an ordinary slow connection cannot finish")
+    }
+
     func testRetiredClientRecordsNothingAndLeavesTheQueueFileAlone() async throws {
         let id = "test.session.retired"; isolate(id)
         let old = makeClient(appID: id, clock: TestClock())

@@ -10,6 +10,10 @@ import Foundation
 /// needs no UIKit. Nothing here blocks the caller: the system runs the block on its own thread,
 /// and that block is what waits.
 final class ProcessHold: @unchecked Sendable {
+    /// The longest the process is held open for one flush. A batch request is bounded under it,
+    /// so a stalled ingest fails while the hold still stands rather than after it has lapsed.
+    static let maximumHold: TimeInterval = 25
+
     private let gate = DispatchSemaphore(value: 0)
 
     init(reason: String) {
@@ -22,7 +26,7 @@ final class ProcessHold: @unchecked Sendable {
                 gate.signal()
                 return
             }
-            _ = gate.wait(timeout: .now() + 25)
+            _ = gate.wait(timeout: .now() + Self.maximumHold)
         }
         #endif
     }

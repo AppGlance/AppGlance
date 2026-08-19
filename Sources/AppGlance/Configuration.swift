@@ -66,8 +66,10 @@ extension AppGlance {
         public var sessionTimeout: TimeInterval
 
         /// Master switch. `false` records and sends nothing (e.g. behind a user setting). Default
-        /// true. Turning it off also discards whatever an earlier run left queued on disk, so a
-        /// consent withdrawal takes effect for events already recorded and not only for new ones.
+        /// true. Turning it off also discards whatever an earlier run left queued on disk and the
+        /// user properties `identify` stored, so a consent withdrawal takes effect for what was
+        /// already recorded and not only for what comes next. The install id itself stays, so
+        /// turning it back on is the same install rather than a new one.
         public var isEnabled: Bool
 
         /// Attach the device's region setting (e.g. `"US"`) to events - a locale, never GPS or IP,
