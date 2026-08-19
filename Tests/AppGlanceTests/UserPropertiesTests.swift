@@ -255,6 +255,33 @@ final class UserPropertiesTests: XCTestCase {
         XCTAssertEqual(owed, [Signal.reset], "the reset is still owed, and commits when its own batch lands")
     }
 
+    /// A batch can come back accepted after a second `configure` has retired the client that sent
+    /// it, and the snapshot key is the install's: the replacement read it at its own init and owns
+    /// it from then on. The two clients' sends are not serialized against each other, so a late
+    /// commit could put an older snapshot over a newer one the replacement has already recorded.
+    func testAnIdentifyAcceptedAfterTheClientIsRetiredCommitsNothing() async throws {
+        let id = "test.traits.retired"; isolate(id)
+        let key = "app.appglance.traits.\(id)"
+        let client = Client(
+            config: TestSupport.configuration(appID: id), userID: "u-\(id)",
+            session: TestSupport.recordingSession())
+        await client.identify([UserProperty.email: "ada@example.com"])
+
+        let hold = RecordingProtocol.holdNextRequest()
+        let flushing = Task { await client.flush() }
+        let started = await TestSupport.waitUntil { hold.isStarted }
+        XCTAssertTrue(started, "the identify is on the wire")
+        await client.shutdown()  // a second configure replaces the client mid-send
+        hold.proceed()  // and the 202 lands afterwards
+        await flushing.value
+
+        XCTAssertNil(
+            UserDefaults.standard.dictionary(forKey: key),
+            "the snapshot key is the replacement's to move")
+        let acknowledged = await client.deliveredTraits()
+        XCTAssertEqual(acknowledged, [:], "and the retired client remembers nothing by it either")
+    }
+
     /// Withdrawing consent has to reach the person's own data. `$email` and `$name` sit in
     /// `UserDefaults`, inside the iCloud and the encrypted backup, and `reset()` cannot clear them
     /// once collection is off - which is the order an app is most likely to use.

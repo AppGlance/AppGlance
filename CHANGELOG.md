@@ -6,6 +6,42 @@ All notable changes to the AppGlance Swift SDK. The format follows
 [GitHub Release](https://github.com/AppGlance/appglance-apple/releases) with the same notes.
 The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-android/blob/main/CHANGELOG.md).
 
+## [Unreleased]
+
+### Fixed
+
+- A dropped presence ping's replacement keeps its distance when the visit ends in between. The
+  15 second floor between a dropped ping and the ping that replaces it was enforced only by the
+  running presence loop, and the loop runs only while the app is in front: a ping dropped by the
+  flush on the way to the background left nothing behind but the rolled-back stamp, so coming
+  back seconds later ticked at once, and a kill and relaunch inside the interval did the same
+  with no live state at all. If the dropped ping had in fact been counted - the ambiguity that
+  makes dropping the safe choice - the two ticks landed seconds apart in rollups the server folds
+  additively and never dedupes. The floor now lives in the stamp itself, which survives both: the
+  replacement is due 15 seconds after the ping it replaces, however the visit ends. The Kotlin
+  SDK makes the same change.
+- A client retired by a second `configure` no longer writes the install's preferences when its
+  last send completes. A request already on the wire cannot be recalled, and its answer can carry
+  the server's presence cadence and acknowledge a `user.identify`. Both were recorded to keys the
+  replacement client had already read at its own init, and the two clients' sends are not
+  serialized against each other, so a late commit could put an older user-properties snapshot
+  over a newer one the replacement had already recorded. A retired client now adopts and commits
+  nothing; a gate-closed client still does both, because those facts are the install's and no
+  replacement exists to own them.
+- A gate that opens with the app already on screen starts the visit's session. The launch's
+  foreground report arrived at the closed gate and moved nothing but the record of it, and
+  nothing re-reports it: an app that collects from TestFlight builds only starts every launch
+  gated behind the App Store guess, so each visit passed with no `session.start`, no presence
+  ping and no flush on leaving, until the next scene-phase change happened to wake it. The
+  reported foreground is re-applied when the gate opens, after `install`, the same way a second
+  `configure` hands it to the replacement client. The events the open inherits from the queue
+  file also get a delivery timer of their own, rather than waiting for a track that may never
+  come.
+- A batch-size trigger that finds a delivery already running leaves the flush timer armed. An
+  event tracked between that delivery's final look at the queue and its trigger clearing had no
+  trigger of its own at `maxBatchSize: 1`, so it sat queued until the app's next call into the
+  SDK.
+
 ## [1.2.1] - 2026-08-19
 
 ### Fixed

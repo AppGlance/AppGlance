@@ -97,6 +97,57 @@ final class EnvironmentTests: XCTestCase {
         XCTAssertEqual(queued.map(\.session_id), [sessionID])
     }
 
+    /// A gate that opens with the app already on screen starts the visit's session then and
+    /// there. The launch's setActive(true) arrived at the closed gate and moved nothing but the
+    /// report, and nothing re-reports it: an app that collects from TestFlight builds only starts
+    /// every launch gated behind the App Store guess, so without the re-apply its whole visit
+    /// passed with no session, no presence and no flush on leaving, until the next scene-phase
+    /// change happened to wake it.
+    func testAGateThatOpensWhileTheAppIsOnScreenStartsTheSession() async throws {
+        let appID = "env.gated.foreground"
+        TestSupport.fresh(appID)
+        let client = Client(
+            config: TestSupport.configuration(appID: appID, enabledEnvironments: [.appStore]),
+            userID: "user-1", session: TestSupport.recordingSession())
+        await client.setActive(true)  // the launch transition, refused at the closed gate
+        var active = await client.isActiveForTesting()
+        XCTAssertFalse(active, "gated: the report was recorded, not acted on")
+
+        await client.adoptEnvironment(.appStore)
+
+        active = await client.isActiveForTesting()
+        XCTAssertTrue(active, "the answer opened the gate with the app on screen")
+        let queued = await client.pendingSignals()
+        XCTAssertTrue(queued.contains(Signal.sessionStart), "so the visit gets its session.start")
+        let looping = await client.presenceLoopIsArmedForTesting()
+        XCTAssertTrue(looping, "and its presence loop")
+        await client.shutdown()
+    }
+
+    /// The queue a gate-open inherits has no trigger of its own: the batch-size trigger is
+    /// reached only by the next `track`, and an app that only ever listens records nothing for
+    /// the rest of the visit. The open arms the flush timer for it.
+    func testAGateThatOpensArmsDeliveryForTheQueueItInherited() async throws {
+        let appID = "env.gated.inherited.trigger"
+        TestSupport.fresh(appID)
+        let waiting = Event(
+            event_id: "22222222-2222-2222-2222-222222222222", session_id: nil, app_id: appID,
+            user_id: "user-1", signal: "purchase", app_version: "1.0", os_name: "iOS",
+            os_version: "26.0", environment: "appstore", country: nil,
+            client_ts: Date(timeIntervalSince1970: 1_700_000_000), metadata: nil)
+        let data = try EventCoding.makeEncoder().encode([waiting])
+        try data.write(to: Client.makeStoreURL(appID: appID), options: .atomic)
+        let client = Client(
+            config: TestSupport.configuration(appID: appID, enabledEnvironments: [.appStore]),
+            userID: "user-1", session: TestSupport.recordingSession())
+
+        await client.adoptEnvironment(.appStore)
+
+        let armed = await client.flushTimerIsArmedForTesting()
+        XCTAssertTrue(armed, "the inherited events must not wait for a track that may never come")
+        await client.shutdown()
+    }
+
     func testAdoptDropsQueueWhenGateCloses() async throws {
         let appID = "env.gate.closes"
         TestSupport.fresh(appID)

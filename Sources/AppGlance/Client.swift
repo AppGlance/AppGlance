@@ -654,7 +654,19 @@ actor Client {
         }
         // A gate that opens is the first moment this client can record anything, and an install
         // minted behind a closed one is still owed its `install`.
-        if collecting, !wasCollecting { recordInstallIfNeeded() }
+        if collecting, !wasCollecting {
+            recordInstallIfNeeded()
+            // The app can already be on screen: the launch's setActive(true) arrived at the
+            // closed gate and moved nothing but the report. It is re-applied here the way the
+            // facade hands one to a replacement client, after `install`, so the visit gets its
+            // session and its presence loop instead of staying dark until the next transition.
+            // A reported background carries nothing, exactly as it does in that hand-over.
+            if reportedActive == true { setActive(true) }
+            // Whatever the file held has no trigger of its own until the app records something:
+            // the batch-size trigger is reached only by the next `track`, and an app that only
+            // ever listens would leave the inherited events sitting for the whole visit.
+            if !queue.isEmpty { scheduleFlush() }
+        }
     }
 
     /// Puts the install's presence stamps and session state back where this client found them.
@@ -940,10 +952,16 @@ actor Client {
     /// Nothing is committed while a NEWER identify or reset is still owed either: what the server
     /// holds now is already superseded, and re-persisting it would put properties a sign-out has
     /// just cleared back on disk. That one commits when its own batch lands.
+    ///
+    /// A retired client commits nothing: its answer can land after a later `configure` has
+    /// replaced it, the snapshot key is the install's, read by the replacement at its own init,
+    /// and the two clients' sends are not serialized against each other - a late commit could
+    /// put an older snapshot over a newer one the replacement has already recorded. A gate-closed
+    /// client still commits: the fact is the install's and no replacement exists to own it.
     private func noteDeliveredTraits(_ batch: [Event], accepted: Int?) {
         if let accepted, accepted < batch.count { return }
         guard let delivered = Self.outstandingTraits(in: batch) else { return }
-        guard pendingTraits == nil, delivered != traits else { return }
+        guard !retired, pendingTraits == nil, delivered != traits else { return }
         traits = delivered
         persistTraits()
     }
@@ -1071,7 +1089,8 @@ actor Client {
     }
 
     /// Undoes the stamp of a ping `requeue` has just dropped, putting it back to the newest ping
-    /// the server acknowledged.
+    /// the server acknowledged - floored so the replacement stays `minHeartbeatRetry` away from
+    /// the ping it replaces.
     ///
     /// The stamp is written when a ping is *queued*, because it is what paces the timer and a
     /// ping still on the wire must not earn a second one. But a dropped ping is one the server
@@ -1100,12 +1119,17 @@ actor Client {
         // without passing through that guard.
         guard collecting, !retired else { return }
         guard let current = lastHeartbeatAt, current <= newestDropped else { return }
-        lastHeartbeatAt = deliveredHeartbeatAt
-        if let restored = deliveredHeartbeatAt {
-            UserDefaults.standard.set(restored.timeIntervalSince1970, forKey: lastHeartbeatKey)
-        } else {
-            UserDefaults.standard.removeObject(forKey: lastHeartbeatKey)
-        }
+        // The floor lives in the stamp, not only in the loop the re-arm below restarts. The
+        // re-arm happens only while the app is in front, and the visit can end, or the process
+        // die, between the drop and the replacement - a background bounce, or a kill and a
+        // relaunch - and either would otherwise tick the moment the app came back, seconds after
+        // the ping it replaces. The stamp is the one record that survives both, so it is rolled
+        // back to the acknowledged ping but never so far that the next tick lands inside the
+        // floor: the next ping is due at `max(acknowledged + interval, dropped + minHeartbeatRetry)`.
+        let floor = newestDropped.addingTimeInterval(minHeartbeatRetry - heartbeatInterval)
+        let restored = max(deliveredHeartbeatAt ?? .distantPast, floor)
+        lastHeartbeatAt = restored
+        UserDefaults.standard.set(restored.timeIntervalSince1970, forKey: lastHeartbeatKey)
         if isActive { startHeartbeat(notBefore: minHeartbeatRetry) }
     }
 
@@ -1114,8 +1138,13 @@ actor Client {
     /// configured a longer interval keeps it - and it is remembered across launches. Out-of-range
     /// values are ignored rather than obeyed: 15 s is the tightest cadence that has any meaning
     /// to the dashboard's 5-minute presence window, and past an hour a "presence" ping is not one.
+    ///
+    /// A retired client adopts nothing, like every other answer that can land after `shutdown()`:
+    /// a request already on the wire cannot be recalled, and the floor key is the install's, read
+    /// by the replacement client at its own init. A gate-closed client still adopts - the fact is
+    /// the install's and no replacement exists to own it.
     private func adoptHeartbeatFloor(_ seconds: TimeInterval?) {
-        guard let seconds, Self.isSaneHeartbeatFloor(seconds) else { return }
+        guard !retired, let seconds, Self.isSaneHeartbeatFloor(seconds) else { return }
         guard seconds != serverHeartbeatFloor else { return }
         serverHeartbeatFloor = seconds
         UserDefaults.standard.set(seconds, forKey: heartbeatFloorKey)
@@ -1176,8 +1205,17 @@ actor Client {
     }
 
     /// The batch-size trigger's delivery, one outstanding at a time. See `flushRequested`.
+    ///
+    /// A trigger that finds one outstanding still leaves the timer armed. The delivery arms one
+    /// itself for whatever its final look at the queue finds, but an event can be tracked between
+    /// that look and the flag clearing, and at `maxBatchSize: 1` that event's own trigger is the
+    /// refusal below: nothing else would ever deliver it. The timer is the net under that gap,
+    /// and a no-op whenever one is already armed.
     private func requestFlush() {
-        guard !flushRequested else { return }
+        guard !flushRequested else {
+            scheduleFlush()
+            return
+        }
         flushRequested = true
         Task { await self.deliverRequestedBatch() }
     }
@@ -1710,6 +1748,10 @@ actor Client {
     /// one: the stamps it writes are the install's, and every build sharing the container
     /// reads them.
     func presenceLoopIsArmedForTesting() -> Bool { heartbeatTask != nil }
+
+    /// Whether an automatic flush timer is armed. Arming one and skipping one look alike from
+    /// the network, so a test needs to be told which happened.
+    func flushTimerIsArmedForTesting() -> Bool { flushTask != nil }
 
     /// One tick of the presence loop, asked for directly. The guards `heartbeat` applies are
     /// defence in depth - every path that arms the loop is gated already, and every path that

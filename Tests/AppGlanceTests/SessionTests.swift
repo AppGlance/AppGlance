@@ -8,13 +8,15 @@ import XCTest
 final class SessionTests: XCTestCase {
 
     private func makeClient(
-        appID: String, clock: TestClock, sessionTimeout: TimeInterval = 300, heartbeatInterval: TimeInterval = 60,
+        appID: String, clock: TestClock, sessionTimeout: TimeInterval = 300, maxBatchSize: Int = 1000,
+        heartbeatInterval: TimeInterval = 60,
         storeAnswer: (@Sendable () async -> (answer: AppEnvironment?, failure: String?))? = nil,
         environmentAnswerGrace: TimeInterval = 3, minHeartbeatRetry: TimeInterval = 15
     ) -> Client {
         Client(
             config: TestSupport.configuration(
-                appID: appID, sessionTimeout: sessionTimeout, heartbeatInterval: heartbeatInterval),
+                appID: appID, sessionTimeout: sessionTimeout, maxBatchSize: maxBatchSize,
+                heartbeatInterval: heartbeatInterval),
             userID: "u-\(appID)", session: TestSupport.recordingSession(), now: { clock.now },
             // A test that supplies an answer is a test that wants the ask path; a test host is a
             // Debug build, where it is otherwise never entered.
@@ -386,8 +388,9 @@ final class SessionTests: XCTestCase {
         let client = makeClient(appID: id, clock: clock, minHeartbeatRetry: 1)
 
         await client.setActive(true)  // session.start at t0
+        await client.flush()  // and it is acknowledged, so the failing batch below is the ping alone
         clock.advance(61)
-        let ticked = await TestSupport.waitForHeartbeats(1, from: client)
+        let ticked = await client.heartbeatForTesting()  // the quiet minute has passed
         XCTAssertTrue(ticked, "the ping is due after a quiet minute")
 
         RecordingProtocol.script([500])
@@ -399,21 +402,24 @@ final class SessionTests: XCTestCase {
         var pings = await client.pendingSignals().filter { $0 == Signal.heartbeat }.count
         XCTAssertEqual(pings, 0, "not at once: the dropped ping may have landed after all")
 
-        // Same visit, same client: presence is owed from the last ping the server acknowledged,
-        // so the replacement arrives long before the fresh interval the dropped stamp would have
-        // bought - without a relaunch to load one from disk.
+        // Same visit, same client: the replacement is due `minHeartbeatRetry` after the dropped
+        // ping, long before the fresh interval the dropped stamp would have bought - without a
+        // relaunch to load anything from disk. The clock crosses that moment here; the waited-out
+        // retry floor is what lets the loop wake up and see it.
+        clock.advance(2)
         let replaced = await TestSupport.waitForHeartbeats(1, from: client)
         XCTAssertTrue(replaced, "the stretch that lost the ping proves presence again itself")
         pings = await client.pendingSignals().filter { $0 == Signal.heartbeat }.count
         XCTAssertEqual(pings, 1, "one replacement, not a stream of them")
+        await client.shutdown()
     }
 
-    /// The roll-back goes back to the newest ping anyone has proof of, and a ping an earlier
-    /// process stamped is proof: the queue file never holds a ping that was in flight, so there is
-    /// nothing left to re-send either way and only this process's own unconfirmed pings are undone.
-    /// Forgetting it makes the install read as never having pinged, so a ping goes out at once and
-    /// the wall-clock promise - at most one per interval, across relaunches - is broken.
-    func testADroppedPingRollsBackOntoTheStampAnEarlierProcessLeft() async throws {
+    /// The roll-back measures the silence that is really outstanding, and it never mints a fresh
+    /// interval: a ping an earlier process stamped is proof the server was heard from, and the
+    /// stamp goes back toward it - stopping at the replacement floor, so the next ping lands
+    /// `minHeartbeatRetry` after the one that was dropped rather than a whole interval later, and
+    /// rather than at once.
+    func testADroppedPingRollsBackTowardTheStampAnEarlierProcessLeft() async throws {
         let id = "test.session.rollback.persisted"; isolate(id)
         let clock = TestClock()
         let defaults = UserDefaults.standard
@@ -424,33 +430,68 @@ final class SessionTests: XCTestCase {
         defaults.set("22222222-2222-2222-2222-222222222222", forKey: "app.appglance.session.\(id)")
         defaults.set(earlier, forKey: "app.appglance.lastHeartbeat.\(id)")
 
-        // A retry floor longer than the test, so the replacement ping cannot arrive and move the
-        // stamp this is about.
-        let client = makeClient(appID: id, clock: clock, minHeartbeatRetry: 600)
+        // The retry floor (15 s of real time here) outlasts the test, so the replacement ping
+        // cannot arrive and move the stamp this is about.
+        let client = makeClient(appID: id, clock: clock)
         await client.setActive(true)
         let ticked = await TestSupport.waitForHeartbeats(1, from: client)
         XCTAssertTrue(ticked, "ten minutes of silence: a ping is owed at once")
+        let dropped = clock.now.timeIntervalSince1970
         XCTAssertEqual(
             defaults.object(forKey: "app.appglance.lastHeartbeat.\(id)") as? Double,
-            clock.now.timeIntervalSince1970, "and queueing it stamps the install")
+            dropped, "and queueing it stamps the install")
 
         RecordingProtocol.script([500])
         await client.flush()  // dropped rather than risk counting it twice
 
+        let restored = try XCTUnwrap(defaults.object(forKey: "app.appglance.lastHeartbeat.\(id)") as? Double)
         XCTAssertEqual(
-            defaults.object(forKey: "app.appglance.lastHeartbeat.\(id)") as? Double, earlier,
-            "so the next ping is paced from the last one the server acknowledged, which is the one on disk")
+            restored, dropped + 15 - 60, accuracy: 0.001,
+            "back toward the acknowledged ping, stopping where the replacement stays 15 s from the drop")
+        await client.shutdown()
+    }
+
+    /// The other half of that bound: the roll-back never goes past the newest ping the server
+    /// acknowledged. A closing tick fires after a quiet minute whatever the cadence, so at a
+    /// sparse one it can be dropped while the acknowledged ping is newer than the replacement
+    /// floor - and pacing from the floor would tick again inside the interval that ping already
+    /// proved.
+    func testARolledBackClosingTickNeverPacesInsideAnAcknowledgedInterval() async throws {
+        let id = "test.session.rollback.acked"; isolate(id)
+        let clock = TestClock()
+        let defaults = UserDefaults.standard
+        let client = makeClient(appID: id, clock: clock, heartbeatInterval: 240)
+
+        await client.setActive(true)  // session.start at t0
+        await client.heartbeatForTesting()  // a ping at t0, sent and acknowledged
+        await client.flush()
+        let acknowledged = clock.now.timeIntervalSince1970
+        XCTAssertEqual(RecordingProtocol.signals().filter { $0 == Signal.heartbeat }.count, 1)
+
+        clock.advance(70)
+        RecordingProtocol.script([500])
+        await client.setActive(false)  // quiet for 70 s: the closing tick goes, and is dropped
+        let failed = await TestSupport.waitUntilAsync {
+            await client.backoffForTesting().failures == 1
+        }
+        XCTAssertTrue(failed, "the departure flush failed, so the closing tick was dropped")
+
+        XCTAssertEqual(
+            defaults.object(forKey: "app.appglance.lastHeartbeat.\(id)") as? Double, acknowledged,
+            "the acknowledged ping is newer than the replacement floor, so it is what paces the next one")
         await client.shutdown()
     }
 
     /// The acknowledged stamp is dropped with the others when the clock steps behind them. Left
-    /// where it is, it is what the next dropped ping rolls back to, so a stamp from the future is
-    /// written straight back to disk and the ping-storm defence is undone for a whole round trip.
+    /// where it is, it is what the next dropped ping rolls back to, so a stamp from the future
+    /// would be written straight back to disk and the ping-storm defence undone for a whole round
+    /// trip. With it gone, the roll-back writes the replacement floor paced from the dropped ping
+    /// itself: a moment in the past, never the future one it was holding.
     func testTheAcknowledgedPingStampIsDroppedWhenItTooIsAheadOfTheClock() async throws {
         let id = "test.session.rollback.futuredelivered"; isolate(id)
         let clock = TestClock()
         let defaults = UserDefaults.standard
-        let client = makeClient(appID: id, clock: clock, heartbeatInterval: 0.2, minHeartbeatRetry: 600)
+        let client = makeClient(appID: id, clock: clock, heartbeatInterval: 0.2, minHeartbeatRetry: 0.1)
 
         await client.setActive(true)  // session.start at t0
         clock.advance(0.25)
@@ -462,6 +503,7 @@ final class SessionTests: XCTestCase {
         clock.advance(-7200)  // corrected backwards, under both stamps at once
         let again = await TestSupport.waitForHeartbeats(2, from: client)
         XCTAssertTrue(again, "the stamps ahead of the clock are dropped, so presence is owed again")
+        let dropped = clock.now.timeIntervalSince1970  // the replacement ping's own stamp
 
         // Leaving is what carries that ping, and the server drops it. Leaving also stops the loop,
         // so nothing after this can move the stamp the assertion is about.
@@ -469,9 +511,13 @@ final class SessionTests: XCTestCase {
         await client.setActive(false)
         await TestSupport.settle(0.3)
 
-        XCTAssertNil(
-            defaults.object(forKey: "app.appglance.lastHeartbeat.\(id)"),
-            "the roll-back had no acknowledged ping to go back to: the one it was holding was in the future too")
+        let restored = try XCTUnwrap(defaults.object(forKey: "app.appglance.lastHeartbeat.\(id)") as? Double)
+        XCTAssertEqual(
+            restored, dropped + 0.1 - 0.2, accuracy: 0.001,
+            "no acknowledged ping to go back to - the one it held was in the future - so the floor stands")
+        XCTAssertLessThanOrEqual(
+            restored, clock.now.timeIntervalSince1970,
+            "and it is a moment in the past, never the future stamp the defence exists to bury")
         await client.shutdown()
     }
 
@@ -625,8 +671,10 @@ final class SessionTests: XCTestCase {
             RecordingProtocol.signals().filter { $0 == Signal.heartbeat }.count, 0,
             "the server never saw that ping")
 
+        clock.advance(2)  // past the replacement floor, which is paced from the dropped ping
         let replaced = await TestSupport.waitForHeartbeats(1, from: client)
-        XCTAssertTrue(replaced, "so presence is still owed, measured from the last ping that was acknowledged")
+        XCTAssertTrue(replaced, "so presence is still owed, and the replacement arrives on the floor")
+        await client.shutdown()
     }
 
     // MARK: - Delivery
@@ -1101,5 +1149,81 @@ final class SessionTests: XCTestCase {
         XCTAssertTrue(oldQueue.isEmpty, "retired: nothing is recorded")
         XCTAssertEqual(RecordingProtocol.signals(), [], "retired: nothing is sent")
         XCTAssertEqual(try TestSupport.persistedSignals(id), ["before"], "the file is untouched")
+    }
+
+    /// A batch can come back after a second `configure` has retired the client that sent it, and
+    /// its answer can carry the server's cadence floor. The floor key is the install's: the
+    /// replacement client read it at its own init and owns it from then on.
+    func testAFloorThatLandsAfterTheClientIsRetiredIsNotAdopted() async throws {
+        let id = "test.session.retired.floor"; isolate(id)
+        let old = makeClient(appID: id, clock: TestClock())
+        await old.track(signal: "before", metadata: nil)
+        RecordingProtocol.scriptResponseBody(#"{"accepted":1,"heartbeat_interval":240}"#)
+        let hold = RecordingProtocol.holdNextRequest()
+        let flushing = Task { await old.flush() }
+        let started = await TestSupport.waitUntil { hold.isStarted }
+        XCTAssertTrue(started, "the batch is on the wire")
+
+        await old.shutdown()  // a second configure replaces the client mid-send
+        hold.proceed()  // the 2xx lands afterwards, floor and all
+        await flushing.value
+
+        XCTAssertNil(
+            UserDefaults.standard.object(forKey: "app.appglance.heartbeatFloor.\(id)"),
+            "the floor key is the replacement's to move")
+        let interval = await old.heartbeatIntervalForTesting()
+        XCTAssertEqual(interval, 60, "and the retired client paces nothing by it")
+    }
+
+    /// The 15 s replacement floor lives in the stamp, so it survives the visit ending. The re-arm
+    /// that enforces it runs only while the app is in front, and a ping dropped by the flush on
+    /// the way to the background used to leave nothing behind but the rolled-back stamp: coming
+    /// back seconds later ticked at once, a second ping within seconds of one the server may well
+    /// have counted, and a relaunch inside the interval did the same with no live state at all.
+    func testADroppedPingsReplacementFloorSurvivesABackgroundBounce() async throws {
+        let id = "test.session.hbretry.bounce"; isolate(id)
+        let clock = TestClock()
+        let client = makeClient(appID: id, clock: clock)
+        await client.setActive(true)  // session.start proves presence at t0
+        await client.flush()  // and is acknowledged, so only the ping is ever owed
+        clock.advance(60)
+        await client.heartbeatForTesting()  // the visit's one ping, stamped t60
+        RecordingProtocol.script([500])
+        clock.advance(1)
+        await client.setActive(false)  // quiet for 1 s: no closing tick, and the flush fails
+        let failed = await TestSupport.waitUntilAsync {
+            await client.backoffForTesting().failures == 1
+        }
+        XCTAssertTrue(failed, "the departure flush failed, so the ping was dropped and rolled back")
+
+        clock.advance(4)
+        await client.setActive(true)  // back five seconds after the dropped ping
+        let wait = await client.timeUntilNextHeartbeatForTesting()
+        XCTAssertEqual(
+            wait, 10, accuracy: 0.01,
+            "the replacement is due 15 s after the ping it replaces, not the moment the app is back")
+        await client.shutdown()
+    }
+
+    /// At `maxBatchSize: 1` every track is its own trigger, and one tracked between a delivery's
+    /// final look at the queue and the trigger flag clearing has only the refusal to speak for
+    /// it. The refusal leaves a timer armed, so the event is delivered without waiting for the
+    /// app to do anything else.
+    func testATriggerRefusedDuringADeliveryLeavesTheFlushTimerArmed() async throws {
+        let id = "test.session.trigger.refused"; isolate(id)
+        let client = makeClient(appID: id, clock: TestClock(), maxBatchSize: 1)
+        let hold = RecordingProtocol.holdNextRequest()
+        await client.track(signal: "one", metadata: nil)  // its own trigger: the delivery starts
+        let started = await TestSupport.waitUntil { hold.isStarted }
+        XCTAssertTrue(started, "the first event is on the wire")
+
+        await client.track(signal: "two", metadata: nil)  // trigger refused: a delivery is out
+        let armed = await client.flushTimerIsArmedForTesting()
+        XCTAssertTrue(armed, "the refusal leaves the timer as the event's trigger")
+
+        hold.proceed()
+        await client.flush()
+        XCTAssertEqual(RecordingProtocol.signals(), ["one", "two"], "and nothing is lost either way")
+        await client.shutdown()
     }
 }
