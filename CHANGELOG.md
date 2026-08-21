@@ -6,7 +6,7 @@ All notable changes to the AppGlance Swift SDK. The format follows
 [GitHub Release](https://github.com/AppGlance/appglance-apple/releases) with the same notes.
 The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-android/blob/main/CHANGELOG.md).
 
-## [Unreleased]
+## [1.2.3] - 2026-08-21
 
 ### Added
 
