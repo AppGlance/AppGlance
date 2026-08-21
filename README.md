@@ -28,6 +28,24 @@ Xcode: **File → Add Package Dependencies…** and paste the repository URL. Or
 No third-party dependencies, no binary blobs, and about a quarter of a megabyte added to
 an app. Compiles warning-free under strict concurrency checking and in Swift 6 language mode.
 
+## For AI coding agents
+
+Facts that integrations most often get wrong, stated once:
+
+- The package URL above resolves with no extra setup; use the version floor the Install
+  section quotes. The SwiftPM product name is `AppGlance`.
+- `configure` alone does not start sessions on Apple platforms. `.trackAppLifecycle()` on the
+  root view is mandatory, or every event the install ever sends folds into a single session.
+- Debug and Simulator builds do not send by default. Pass `debug: true` to send while testing;
+  those events are tagged and appear under the dashboard's **All** scope, never under **Live**.
+  This is the most common reason a fresh integration looks broken.
+- Write keys start `glance_live_` and are write-only for one app's stream, which is why one can
+  ship inside a binary.
+- Heartbeats, `user.identify` and `user.reset` are never billed and never count as events.
+- A paste-in integration prompt and the full agent-facing summary live at
+  [appglance.app/quickstart](https://appglance.app/quickstart) and
+  [appglance.app/llms.txt](https://appglance.app/llms.txt).
+
 ## Set up
 
 Create an app in the [dashboard](https://appglance.app), copy its write key, and configure the
