@@ -9,14 +9,14 @@ final class SessionTests: XCTestCase {
 
     private func makeClient(
         appID: String, clock: TestClock, sessionTimeout: TimeInterval = 300, maxBatchSize: Int = 1000,
-        heartbeatInterval: TimeInterval = 60,
+        heartbeatInterval: TimeInterval = 60, debug: Bool = false,
         storeAnswer: (@Sendable () async -> (answer: AppEnvironment?, failure: String?))? = nil,
         environmentAnswerGrace: TimeInterval = 3, minHeartbeatRetry: TimeInterval = 15
     ) -> Client {
         Client(
             config: TestSupport.configuration(
                 appID: appID, sessionTimeout: sessionTimeout, maxBatchSize: maxBatchSize,
-                heartbeatInterval: heartbeatInterval),
+                heartbeatInterval: heartbeatInterval, debug: debug),
             userID: "u-\(appID)", session: TestSupport.recordingSession(), now: { clock.now },
             // A test that supplies an answer is a test that wants the ask path; a test host is a
             // Debug build, where it is otherwise never entered.
@@ -264,6 +264,46 @@ final class SessionTests: XCTestCase {
         await second.flush()
         interval = await second.heartbeatIntervalForTesting()
         XCTAssertEqual(interval, 60)
+    }
+
+    /// The server's two deliberate-drop counts reach the developer's console in debug mode. The
+    /// response is read by the very loop that is broken, so these lines are how a `track()` call
+    /// in a loop, or a plan out of allowance, is noticed from Xcode rather than days later from a
+    /// quota email.
+    func testAThrottledOrOverQuotaAnswerIsSaidOutLoudInDebug() async throws {
+        let id = "test.session.serverdrops"; isolate(id)
+        // The capture closure is invoked on the client actor, so the collected lines live behind
+        // a lock rather than in a captured local the compiler would rightly refuse.
+        final class Captured: @unchecked Sendable {
+            private let lock = NSLock()
+            private var storage: [String] = []
+            func append(_ s: String) { lock.lock(); storage.append(s); lock.unlock() }
+            func clear() { lock.lock(); storage = []; lock.unlock() }
+            var lines: [String] { lock.lock(); defer { lock.unlock() }; return storage }
+        }
+        let captured = Captured()
+        Log.captureForTesting = { captured.append($0) }
+        addTeardownBlock { Log.captureForTesting = nil }
+
+        let client = makeClient(appID: id, clock: TestClock(), debug: true)
+        RecordingProtocol.scriptResponseBody(#"{"accepted":10,"throttled":90,"over_quota_dropped":3}"#)
+        await client.track(signal: "a", metadata: nil)
+        await client.flush()
+        XCTAssertTrue(
+            captured.lines.contains { $0.contains("rate limited 90 events from this install") },
+            "the throttle count is said with its likely cause: \(captured.lines)")
+        XCTAssertTrue(
+            captured.lines.contains { $0.contains("3 events not stored") && $0.contains("cap") },
+            "the over-quota count is said with the way out: \(captured.lines)")
+
+        // A clean answer stays quiet: these lines exist for the two problems, not for every send.
+        captured.clear()
+        RecordingProtocol.scriptResponseBody(#"{"accepted":1,"rejected":0}"#)
+        await client.track(signal: "b", metadata: nil)
+        await client.flush()
+        XCTAssertFalse(
+            captured.lines.contains { $0.contains("rate limited") || $0.contains("not stored") },
+            "nothing was dropped, so nothing is warned about: \(captured.lines)")
     }
 
     func testRelaunchWithinTimeoutContinuesTheSessionAcrossProcesses() async throws {

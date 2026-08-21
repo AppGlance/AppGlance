@@ -1586,16 +1586,39 @@ actor Client {
         // Supabase backend answers nothing (return=minimal). Anything unparseable is simply not
         // a hint - the batch was accepted either way.
         adoptHeartbeatFloor(Self.heartbeatFloor(in: data))
-        return Self.acceptedCount(in: data)
+        logServerDrops(in: data)
+        return Self.serverCount("accepted", in: data)
     }
 
-    /// `accepted` from an ingest response body, if it carries one: how many of the rows sent the
-    /// server actually took. A batch can be answered 2xx and still be counted short - past the
-    /// plan's grace ceiling, or under the per-install rate limiter.
-    nonisolated private static func acceptedCount(in data: Data) -> Int? {
+    /// A 2xx can also carry two counts of well-formed rows the server deliberately did not keep,
+    /// and each names a problem only the developer can fix, so debug mode says them out loud.
+    /// `throttled` is the per-install rate limiter: this one install sent faster than any real
+    /// usage does, which in practice is an event call in a loop. `over_quota_dropped` is the plan
+    /// gate: the account is past its cap and its grace, and billable events are not being stored.
+    /// Neither is re-sent, by the server's design: re-sending would feed the loop in the first
+    /// case and cannot succeed in the second, and none of it counts against the plan.
+    private func logServerDrops(in data: Data) {
+        guard config.debug else { return }
+        if let throttled = Self.serverCount("throttled", in: data), throttled > 0 {
+            log(
+                "⚠ the server rate limited \(throttled) event\(throttled == 1 ? "" : "s") from this install"
+                    + " - faster than any real usage sends; look for a track() call in a loop")
+        }
+        if let dropped = Self.serverCount("over_quota_dropped", in: data), dropped > 0 {
+            log(
+                "⚠ \(dropped) event\(dropped == 1 ? "" : "s") not stored: the account is past its plan's cap"
+                    + " and grace; upgrade in the dashboard, or recording resumes when the month resets")
+        }
+    }
+
+    /// An integer field of an ingest response body, if it carries one. `accepted` is how many of
+    /// the rows sent the server actually took: a batch can be answered 2xx and still be counted
+    /// short - past the plan's grace ceiling, or under the per-install rate limiter, each of
+    /// which also states its own count (see `logServerDrops`).
+    nonisolated private static func serverCount(_ field: String, in data: Data) -> Int? {
         guard !data.isEmpty,
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let value = object["accepted"]
+            let value = object[field]
         else { return nil }
         if let number = value as? NSNumber { return number.intValue }
         if let string = value as? String { return Int(string) }

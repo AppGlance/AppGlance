@@ -6,6 +6,19 @@ All notable changes to the AppGlance Swift SDK. The format follows
 [GitHub Release](https://github.com/AppGlance/appglance-apple/releases) with the same notes.
 The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-android/blob/main/CHANGELOG.md).
 
+## [Unreleased]
+
+### Added
+
+- Debug mode now says out loud when the server deliberately kept less than it was sent. A 202
+  can carry `throttled` (the per-install rate limiter: one install sending faster than any real
+  usage does, in practice an event call in a loop) and `over_quota_dropped` (the plan gate: the
+  account is past its cap and its grace). Both counts were already in the response and the SDK
+  read past them, so the one place the problem was visible was read only by the loop that caused
+  it. With `debug: true` each now logs one line naming the count and the likely cause. Release
+  builds are unchanged: nothing is printed, nothing is re-sent, and none of it ever counts
+  against the plan.
+
 ## [1.2.2] - 2026-08-19
 
 ### Fixed
