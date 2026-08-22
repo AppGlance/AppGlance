@@ -13,7 +13,7 @@ consent banner, and two lines of setup. The Kotlin SDK is at
 Xcode: **File → Add Package Dependencies…** and paste the repository URL. Or in `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/AppGlance/appglance-apple.git", from: "1.2.3")
+.package(url: "https://github.com/AppGlance/appglance-apple.git", from: "1.2.4")
 ```
 
 | Platform | Minimum |
