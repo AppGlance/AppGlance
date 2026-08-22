@@ -203,6 +203,16 @@ actor Client {
     /// they were new.
     private let installPendingKey: String
 
+    /// What the device knew about this app before the SDK ran, once anything has answered:
+    /// `Configuration.firstInstalledAt` at startup, or the store's answer when it arrives.
+    private var origin: InstallOrigin?
+    /// Set once the origin has been put on a carrier event, and read as absent-means-owed. An
+    /// install set up before this SDK version has nothing written here, which is exactly right:
+    /// those installs were counted as new on the day their app adopted the SDK and are the ones
+    /// with the most to correct, so the first carrier after the upgrade backfills them.
+    private let originSentKey: String
+    private var originOwed: Bool
+
     /// Whether this build has anything to ask the store about. A compile-time environment
     /// (Simulator, Debug) has not, so the question is closed before it is opened. Injected rather
     /// than read directly so tests can drive the ask path at all: a test host is a Debug build,
@@ -211,13 +221,13 @@ actor Client {
     /// The ask itself, injected alongside `asksTheStore` and for the same reason: the real one
     /// answers a test host instantly, so a wait a slow store is meant to bound has nothing to
     /// bound there.
-    private let storeAnswer: @Sendable () async -> (answer: AppEnvironment?, failure: String?)
+    private let storeAnswer: @Sendable () async -> StoreAnswer
 
     init(
         config: AppGlance.Configuration, userID: String, isNewInstall: Bool = false, installAt: Date = Date(),
         session: URLSession = .shared, now: @escaping @Sendable () -> Date = { Date() },
         asksTheStore: Bool = !AppEnvironment.isCompileTimeDetermined,
-        storeAnswer: @escaping @Sendable () async -> (answer: AppEnvironment?, failure: String?) = {
+        storeAnswer: @escaping @Sendable () async -> StoreAnswer = {
             await AppEnvironment.storeAnswer()
         },
         environmentAnswerGrace: TimeInterval = 3,
@@ -243,6 +253,7 @@ actor Client {
         self.heartbeatFloorKey = "app.appglance.heartbeatFloor.\(config.appID)"
         self.traitsKey = "app.appglance.traits.\(config.appID)"
         self.installPendingKey = "app.appglance.installPending.\(config.appID)"
+        self.originSentKey = "app.appglance.originSent.\(config.appID)"
         let defaults = UserDefaults.standard
         // A minted id means this device is not the one that state was written on. The install id
         // is device-bound (a `ThisDeviceOnly` Keychain item, mirrored outside the backup), but
@@ -254,6 +265,14 @@ actor Client {
         // dashboard stays empty however often the app calls `identify`. A genuinely new install
         // has nothing here to clear, so this costs it nothing.
         if isNewInstall { Self.resetSessionState(appID: config.appID) }
+        // The app's own date outranks the store's and needs no ask, so it is here from the start
+        // and rides this launch's `install` rather than waiting for a later carrier. An
+        // implausible one is dropped rather than clamped; see `InstallOrigin.isPlausible`.
+        if let supplied = config.firstInstalledAt {
+            let claimed = InstallOrigin(firstInstalledAt: supplied, evidence: .app)
+            if claimed.isPlausible(now: now()) { self.origin = claimed }
+        }
+        self.originOwed = !defaults.bool(forKey: originSentKey)
         if let floor = defaults.object(forKey: heartbeatFloorKey) as? Double, Self.isSaneHeartbeatFloor(floor) {
             self.serverHeartbeatFloor = floor
         }
@@ -519,20 +538,24 @@ actor Client {
         environmentAsks += 1
         let ask = storeAnswer
         refineTask = Task { [weak self] in
-            let (answer, failure) = await ask()
-            await self?.adoptStoreAnswer(answer, failure: failure)
+            let answered = await ask()
+            await self?.adoptStoreAnswer(
+                answered.environment, origin: answered.origin, failure: answered.failure)
         }
     }
 
     /// nil means the store had no answer this time: the task slot clears so a later flush asks
     /// again, and the guessed label stands meanwhile. Once the ask ceiling is reached the guess
     /// stands for the rest of the run.
-    func adoptStoreAnswer(_ answer: AppEnvironment?, failure: String? = nil) {
+    func adoptStoreAnswer(_ answer: AppEnvironment?, origin: InstallOrigin? = nil, failure: String? = nil) {
         refineTask = nil
         // Whatever this ask settled - a corrected label, or the guess standing for the run - is
         // what a flush parked on the grace is waiting for, so it goes on from here.
         defer { releaseEnvironmentWaiters() }
         guard !retired else { return }
+        // The origin is settled last, after the label has had its say: the answer can open the
+        // sending gate, and only then is there a queue to stamp and a client allowed to record.
+        defer { adoptOrigin(origin) }
         guard let answer else {
             let again = environmentAsks < maxEnvironmentAsks
             log(
@@ -545,6 +568,60 @@ actor Client {
         guard !environmentAnswered else { return }
         environmentAnswered = true
         adoptEnvironment(answer)
+    }
+
+    /// Takes the store's account of when this app first arrived, unless something better is
+    /// already held: `Configuration.firstInstalledAt` is the app's own record and outranks it.
+    ///
+    /// A nil answer is not a correction, it is silence - the ask failed, or this build never asks
+    /// - so it leaves whatever is held alone and the origin stays owed for a later launch.
+    private func adoptOrigin(_ answer: InstallOrigin?) {
+        if let answer, origin?.evidence != .app, answer.isPlausible(now: now()) {
+            origin = answer
+        }
+        stampOrigin()
+    }
+
+    /// Puts the origin on a carrier already sitting in the queue, which on the launch that adopts
+    /// the SDK is this install's own `install` event: the first flush waits for the store's
+    /// answer, so that event is nearly always still here when the answer lands. Anything not
+    /// caught here waits for the next carrier `track` records.
+    ///
+    /// Only an event THIS run recorded will do. An inherited one is an event an earlier run left
+    /// on disk, and the reason it is still there may be a lost acknowledgement rather than a lost
+    /// send: the server has seen that event id and ignores a replay of it, so metadata added to it
+    /// now would be dropped on arrival - silently, and for good, because the origin is marked sent
+    /// either way. Passing it over costs this install one session's delay and nothing else.
+    ///
+    /// Marked sent the moment it is queued rather than when it is delivered, the same way
+    /// `install` is: a death in between costs this install one label, where clearing it after
+    /// delivery would put the same fact on a second carrier and give the server two answers to
+    /// reconcile.
+    private func stampOrigin() {
+        guard !retired, collecting, originOwed, let origin else { return }
+        let extra = origin.metadata
+        guard
+            let index = queue.lastIndex(where: {
+                Self.carriesOrigin($0.signal) && !inheritedEventIDs.contains($0.event_id)
+            })
+        else { return }
+        queue[index] = queue[index].carrying(extra)
+        markOriginSent()
+        persist()
+        log("▸ install origin on \(queue[index].signal) \(extra)")
+    }
+
+    /// The signals the origin is allowed to ride. Both are the SDK's own, so nothing here can
+    /// overwrite a key an app chose: `user.identify` is excluded because its metadata IS the
+    /// user's property set and the server stores it as sent, and `heartbeat` because a ping is
+    /// never stored as an event at all.
+    private static func carriesOrigin(_ signal: String) -> Bool {
+        signal == Signal.install || signal == Signal.sessionStart
+    }
+
+    private func markOriginSent() {
+        originOwed = false
+        UserDefaults.standard.set(true, forKey: originSentKey)
     }
 
     /// Adopts the store's answer for where this build runs. Queued events carrying this run's
@@ -745,6 +822,15 @@ actor Client {
     /// tracked back to back keep their order even if they are applied a moment later.
     func track(signal: String, metadata: [String: String]?, at: Date? = nil) {
         guard collecting, !retired else { return }
+        // The origin rides the first of the SDK's own events recorded once something has answered
+        // for it: this install's `install` when the app supplied the date itself, and otherwise
+        // whichever `session.start` follows the store's answer. `stampOrigin` catches the far more
+        // common case where the answer lands while `install` is still in the queue.
+        var metadata = metadata
+        if originOwed, Self.carriesOrigin(signal), let origin {
+            metadata = (metadata ?? [:]).merging(origin.metadata) { existing, _ in existing }
+            markOriginSent()
+        }
         let event = Event(
             event_id: UUID().uuidString.lowercased(),
             session_id: sessionID,
@@ -1817,6 +1903,7 @@ actor Client {
         UserDefaults.standard.removeObject(forKey: "app.appglance.lastHeartbeat.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.lastEvent.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.installPending.\(appID)")
+        UserDefaults.standard.removeObject(forKey: "app.appglance.originSent.\(appID)")
         UserDefaults.standard.removeObject(forKey: "app.appglance.traits.\(appID)")
     }
 }

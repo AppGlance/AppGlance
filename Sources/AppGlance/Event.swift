@@ -31,6 +31,19 @@ struct Event: Codable, Equatable, Sendable {
             signal: signal, app_version: app_version, os_name: os_name, os_version: os_version,
             environment: environment, country: country, client_ts: client_ts, metadata: metadata)
     }
+
+    /// The same event carrying `extra` alongside whatever metadata it already had, used to stamp
+    /// the install origin onto a carrier still sitting in the queue (see `Client.stampOrigin`).
+    /// Keys the event already carries win: `extra` is the SDK's, and an app's own value for a key
+    /// must never be overwritten by one invented here.
+    func carrying(_ extra: [String: String]) -> Event {
+        guard !extra.isEmpty else { return self }
+        let merged = (metadata ?? [:]).merging(extra) { existing, _ in existing }
+        return Event(
+            event_id: event_id, session_id: session_id, app_id: app_id, user_id: user_id,
+            signal: signal, app_version: app_version, os_name: os_name, os_version: os_version,
+            environment: environment, country: country, client_ts: client_ts, metadata: merged)
+    }
 }
 
 /// The one JSON dialect the SDK speaks, on the wire and on disk. Timestamps are ISO-8601 UTC
@@ -48,6 +61,10 @@ enum EventCoding {
         formatter.formatOptions = [.withInternetDateTime]
         return formatter
     }()
+
+    /// The wire form of a timestamp that travels inside metadata rather than in `client_ts`,
+    /// which the encoder handles. One dialect, whichever field the date rides in.
+    static func timestamp(_ date: Date) -> String { fractional.string(from: date) }
 
     static func makeEncoder() -> JSONEncoder {
         let encoder = JSONEncoder()

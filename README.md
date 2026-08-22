@@ -42,6 +42,10 @@ Facts that integrations most often get wrong, stated once:
 - Write keys start `glance_live_` and are write-only for one app's stream, which is why one can
   ship inside a binary.
 - Heartbeats, `user.identify` and `user.reset` are never billed and never count as events.
+- Adding AppGlance to an app that already has users does **not** report them all as new: the SDK
+  sends when the app first arrived (`AppTransaction.originalPurchaseDate`) and the dashboard
+  counts them as "already had it". Pass `firstInstalledAt` only if the app knows a date that
+  reaches further back than the App Store's.
 - A paste-in integration prompt and the full agent-facing summary live at
   [appglance.app/quickstart](https://appglance.app/quickstart) and
   [appglance.app/llms.txt](https://appglance.app/llms.txt).
@@ -148,6 +152,7 @@ AppGlance.configure(AppGlance.Configuration(
 | `isEnabled` | `true` | Master off-switch (e.g. behind a user setting). Wins over everything, including `debug`. Turning it off also discards whatever an earlier run left queued on disk and the user properties `identify` stored, so a consent withdrawal covers what was already recorded, not just what comes next. |
 | `collectsCountry` | `true` | The device's region *setting* as a two-letter code. Not GPS, not IP. |
 | `enabledEnvironments` | `[.appStore, .testFlight]` | Which environments send; Simulator and Debug builds never do by default. |
+| `firstInstalledAt` | `nil` (asks the App Store) | When this person first got your app. Only worth setting if your app knows better than the store does; see below. |
 | `debug` | `false` | Sends from any environment (tag stays truthful) and logs to the console. |
 | `endpoint` | hosted ingest | Point it at your own deployment of the ingest service. |
 | `appID`, `appVersion` | bundle id, `CFBundleShortVersionString` | Informational in hosted mode (the key identifies the app). |
@@ -166,6 +171,38 @@ the beta-distribution signing certificate - and the first flush waits briefly fo
 answer; anything already queued is restamped when it arrives. A build the store cannot vouch
 for at all, such as an ad hoc or enterprise build or a Mac app downloaded from a website,
 keeps the guess.
+
+### Adding AppGlance to an app that already has users
+
+Every existing install mints its AppGlance id the first time your new build runs, so without
+help they would all read as new users on the day you ship: one enormous spike, with your real
+arrivals buried in it.
+
+They do not. The SDK reports when the app first arrived - `AppTransaction.originalPurchaseDate`,
+the date this Apple ID first got your app, which the SDK is already fetching to work out whether
+this is a TestFlight or App Store build. The dashboard counts those people as **already had it**
+rather than new, and your new-user numbers mean what they say from day one.
+
+Nothing to switch on. It costs no extra API call, needs no permission, and adds nothing to your
+App Store privacy answers: it is a date about the app, not about the person, sent once per
+install alongside the `install` event.
+
+Two things worth knowing:
+
+- The store's date is per Apple ID, not per device. Someone who bought your app three years ago,
+  deleted it and downloads it again today counts as already having had it - which is true.
+- It cannot see further back than the App Store. If you keep your own signup or first-launch
+  date, pass it as `firstInstalledAt` and it wins over the store's answer:
+
+  ```swift
+  var config = AppGlance.Configuration(apiKey: "glance_live_…")
+  config.firstInstalledAt = myAccount.createdAt
+  AppGlance.configure(config)
+  ```
+
+Already shipped an older AppGlance and watched that spike happen? Upgrading fixes it. Every
+install that has not sent its date yet backfills on its next session, so the base corrects
+itself as people open the app.
 
 ## Guarantees
 

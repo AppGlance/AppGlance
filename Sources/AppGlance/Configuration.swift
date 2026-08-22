@@ -83,6 +83,28 @@ extension AppGlance {
         /// See `AppEnvironment` for where that split comes from.
         public var enabledEnvironments: Set<AppEnvironment>
 
+        /// When this person first got your app, if you already know. Optional, and only worth
+        /// setting if you are adding AppGlance to an app that already has users.
+        ///
+        /// Without it, every existing user mints an install id on the day your first AppGlance
+        /// build ships, so all of them read as new users that day and your real arrivals are lost
+        /// among them. On Apple platforms the SDK asks the App Store for the answer by itself and
+        /// usually gets it, so setting this is a refinement rather than a requirement. Set it when
+        /// your app knows better than the store does, which it does whenever you keep your own
+        /// signup or first-launch date:
+        ///
+        /// ```swift
+        /// var config = AppGlance.Configuration(apiKey: "glance_live_…")
+        /// config.firstInstalledAt = myAccount.createdAt
+        /// AppGlance.configure(config)
+        /// ```
+        ///
+        /// It is a date, never a name or an id, it is sent once per install, and it changes
+        /// nothing about the events themselves: the dashboard uses it to sort a first sighting
+        /// into "new" or "was already here" and for nothing else. A date in the future, or one
+        /// before the App Store existed, is ignored.
+        public var firstInstalledAt: Date?
+
         /// Debug mode, for while you wire the SDK up. Default false. When on:
         ///
         /// - **This build sends**, whatever its environment. Events keep their real tag
@@ -106,7 +128,8 @@ extension AppGlance {
             isEnabled: Bool = true,
             collectsCountry: Bool = true,
             enabledEnvironments: Set<AppEnvironment> = [.appStore, .testFlight],
-            debug: Bool = false
+            debug: Bool = false,
+            firstInstalledAt: Date? = nil
         ) {
             self.init(
                 backend: .hosted(endpoint: endpoint, apiKey: apiKey),
@@ -119,7 +142,8 @@ extension AppGlance {
                 isEnabled: isEnabled,
                 collectsCountry: collectsCountry,
                 enabledEnvironments: enabledEnvironments,
-                debug: debug
+                debug: debug,
+                firstInstalledAt: firstInstalledAt
             )
         }
 
@@ -137,7 +161,8 @@ extension AppGlance {
             isEnabled: Bool = true,
             collectsCountry: Bool = true,
             enabledEnvironments: Set<AppEnvironment> = [.appStore, .testFlight],
-            debug: Bool = false
+            debug: Bool = false,
+            firstInstalledAt: Date? = nil
         ) {
             self.init(
                 backend: .supabase(url: supabaseURL, publishableKey: publishableKey),
@@ -150,7 +175,8 @@ extension AppGlance {
                 isEnabled: isEnabled,
                 collectsCountry: collectsCountry,
                 enabledEnvironments: enabledEnvironments,
-                debug: debug
+                debug: debug,
+                firstInstalledAt: firstInstalledAt
             )
         }
 
@@ -181,7 +207,8 @@ extension AppGlance {
             isEnabled: Bool,
             collectsCountry: Bool,
             enabledEnvironments: Set<AppEnvironment>,
-            debug: Bool
+            debug: Bool,
+            firstInstalledAt: Date? = nil
         ) {
             self.backend = backend
             self.appID = appID
@@ -199,6 +226,7 @@ extension AppGlance {
             self.collectsCountry = collectsCountry
             self.enabledEnvironments = enabledEnvironments
             self.debug = debug
+            self.firstInstalledAt = firstInstalledAt
         }
 
         // MARK: - Bounds
@@ -228,7 +256,8 @@ extension AppGlance {
                 backend: backend, appID: appID, appVersion: appVersion, flushInterval: flushInterval,
                 maxBatchSize: maxBatchSize, heartbeatInterval: heartbeatInterval, sessionTimeout: sessionTimeout,
                 isEnabled: isEnabled, collectsCountry: collectsCountry,
-                enabledEnvironments: enabledEnvironments, debug: debug)
+                enabledEnvironments: enabledEnvironments, debug: debug,
+                firstInstalledAt: firstInstalledAt)
         }
 
         private static func clamped(

@@ -50,15 +50,24 @@ public enum AppEnvironment: String, Sendable, CaseIterable {
     /// can fail (an offline first launch, an ad hoc or enterprise build). Callers treat nil as
     /// "ask again later", never as an answer, and `AppTransaction.refresh()` is not an option:
     /// it can put a sign-in prompt on screen, which an analytics SDK must never do.
-    static func storeAnswer() async -> (answer: AppEnvironment?, failure: String?) {
-        guard !isCompileTimeDetermined else { return (nil, nil) }
+    ///
+    /// The same payload carries when this Apple ID first got the app, which is what tells a
+    /// genuinely new user from one who has had the app for years and only just met the SDK. It
+    /// comes back as `origin`; one ask, both answers.
+    static func storeAnswer() async -> StoreAnswer {
+        guard !isCompileTimeDetermined else { return StoreAnswer() }
         do {
             let transaction = try await AppTransaction.shared.payloadValue
-            return (refined(from: transaction.environment, fallback: current), nil)
+            return StoreAnswer(
+                environment: refined(from: transaction.environment, fallback: current),
+                origin: InstallOrigin(
+                    firstInstalledAt: transaction.originalPurchaseDate,
+                    evidence: .store,
+                    originalAppVersion: transaction.originalAppVersion))
         } catch {
             // The reason travels back for debug-mode narration: a diagnostic TestFlight build
             // with `debug: true` is the one place this failure can actually be watched.
-            return (nil, String(describing: error))
+            return StoreAnswer(failure: String(describing: error))
         }
     }
 
@@ -93,6 +102,18 @@ public enum AppEnvironment: String, Sendable, CaseIterable {
         return Bundle.main.appStoreReceiptURL?.lastPathComponent == "sandboxReceipt"
         #endif
     }
+}
+
+/// What one ask of the store came back with. A single value rather than a tuple because the ask
+/// answers two unrelated questions off one payload: where this build runs, and how long this
+/// Apple ID has had the app.
+struct StoreAnswer: Sendable {
+    /// Where this build runs, or nil when the store had no answer this time.
+    var environment: AppEnvironment?
+    /// When this Apple ID first got the app, or nil for the same reason.
+    var origin: InstallOrigin?
+    /// Why the ask failed, for debug-mode narration.
+    var failure: String?
 }
 
 extension AppEnvironment {

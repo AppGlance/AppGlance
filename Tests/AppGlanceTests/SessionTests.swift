@@ -10,7 +10,7 @@ final class SessionTests: XCTestCase {
     private func makeClient(
         appID: String, clock: TestClock, sessionTimeout: TimeInterval = 300, maxBatchSize: Int = 1000,
         heartbeatInterval: TimeInterval = 60, debug: Bool = false,
-        storeAnswer: (@Sendable () async -> (answer: AppEnvironment?, failure: String?))? = nil,
+        storeAnswer: (@Sendable () async -> StoreAnswer)? = nil,
         environmentAnswerGrace: TimeInterval = 3, minHeartbeatRetry: TimeInterval = 15
     ) -> Client {
         Client(

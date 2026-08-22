@@ -6,6 +6,37 @@ All notable changes to the AppGlance Swift SDK. The format follows
 [GitHub Release](https://github.com/AppGlance/appglance-apple/releases) with the same notes.
 The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-android/blob/main/CHANGELOG.md).
 
+## [Unreleased]
+
+### Added
+
+- **Existing users are no longer counted as new.** An app that adds AppGlance years after launch
+  has a user base the SDK has never seen, and every one of those installs used to read as a brand
+  new user on the day that build shipped: one enormous spike, with the real arrivals buried in it.
+  The SDK now reports when the app first arrived, so the dashboard can tell the two apart.
+
+  On Apple platforms the answer is already in hand and costs nothing: the signed `AppTransaction`
+  the SDK fetches to label the environment also carries `originalPurchaseDate`, the date this
+  Apple ID first got the app. No new API, no permission, no privacy-manifest entry, nothing added
+  to your App Store answers - it is a date about the app, not about the person, and it is sent
+  once per install.
+
+  Nothing to do to get it. Upgrading is enough: an install that has never sent one backfills on
+  its next `session.start`, so an app already running an older AppGlance corrects its whole base
+  as people open it.
+
+- `Configuration.firstInstalledAt`, for when your app knows better than the App Store does. The
+  store's date is per Apple ID, so it cannot see a user who had an account with you before they
+  had this device. If you keep your own signup or first-launch date, pass it and it wins:
+
+  ```swift
+  var config = AppGlance.Configuration(apiKey: "glance_live_…")
+  config.firstInstalledAt = myAccount.createdAt
+  AppGlance.configure(config)
+  ```
+
+  A date in the future, or one from before the App Store existed, is ignored.
+
 ## [1.2.3] - 2026-08-21
 
 ### Added

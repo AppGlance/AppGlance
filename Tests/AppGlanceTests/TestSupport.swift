@@ -256,11 +256,12 @@ final class StoreAnswerGate: @unchecked Sendable {
     private let lock = NSLock()
     private var asked = false
     private var value: AppEnvironment?
+    private var originValue: InstallOrigin?
     private let gate = DispatchSemaphore(value: 0)
 
     /// Pass `{ await gate.ask() }` as the client's `storeAnswer`: it records the ask, then waits
     /// for `answer(_:)`.
-    func ask() async -> (answer: AppEnvironment?, failure: String?) {
+    func ask() async -> StoreAnswer {
         lock.lock(); asked = true; lock.unlock()
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             DispatchQueue.global().async { [self] in
@@ -269,12 +270,12 @@ final class StoreAnswerGate: @unchecked Sendable {
             }
         }
         lock.lock(); defer { lock.unlock() }
-        return (value, nil)
+        return StoreAnswer(environment: value, origin: originValue)
     }
 
     /// Answers the ask. Safe to call again in teardown: a surplus signal leaves nothing blocked.
-    func answer(_ environment: AppEnvironment?) {
-        lock.lock(); value = environment; lock.unlock()
+    func answer(_ environment: AppEnvironment?, origin: InstallOrigin? = nil) {
+        lock.lock(); value = environment; originValue = origin; lock.unlock()
         gate.signal()
     }
 
