@@ -60,9 +60,9 @@ public enum AppEnvironment: String, Sendable, CaseIterable {
             let transaction = try await AppTransaction.shared.payloadValue
             return StoreAnswer(
                 environment: refined(from: transaction.environment, fallback: current),
-                origin: InstallOrigin(
-                    firstInstalledAt: transaction.originalPurchaseDate,
-                    evidence: .store,
+                origin: storeOrigin(
+                    from: transaction.environment,
+                    purchased: transaction.originalPurchaseDate,
                     originalAppVersion: transaction.originalAppVersion))
         } catch {
             // The reason travels back for debug-mode narration: a diagnostic TestFlight build
@@ -80,6 +80,18 @@ public enum AppEnvironment: String, Sendable, CaseIterable {
         case .xcode: return .debug
         default: return fallback
         }
+    }
+
+    /// The store's account of when this Apple ID first got the app, or nil where it has no real
+    /// one. Only a production transaction carries it: the sandbox - TestFlight, and StoreKit
+    /// testing in Xcode - answers every account with the same placeholder purchase date and
+    /// version, which say nothing about the person holding the device. A TestFlight install
+    /// therefore sends no store date; `Configuration.firstInstalledAt` still reaches it.
+    static func storeOrigin(
+        from store: AppStore.Environment, purchased: Date, originalAppVersion: String
+    ) -> InstallOrigin? {
+        guard store == .production else { return nil }
+        return InstallOrigin(firstInstalledAt: purchased, evidence: .store, originalAppVersion: originalAppVersion)
     }
 
     private static var isTestFlight: Bool {

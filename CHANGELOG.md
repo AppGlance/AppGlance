@@ -19,7 +19,8 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
   the SDK fetches to label the environment also carries `originalPurchaseDate`, the date this
   Apple ID first got the app. No new API, no permission, no privacy-manifest entry, nothing added
   to your App Store answers - it is a date about the app, not about the person, and it is sent
-  once per install.
+  once per install. TestFlight builds send no store date: the sandbox answers every account with
+  the same placeholder, which is not evidence of anything.
 
   Nothing to do to get it. Upgrading is enough: an install that has never sent one backfills on
   its next `session.start`, so an app already running an older AppGlance corrects its whole base
@@ -35,7 +36,7 @@ The Kotlin SDK has [its own changelog](https://github.com/AppGlance/appglance-an
   AppGlance.configure(config)
   ```
 
-  A date in the future, or one from before the App Store existed, is ignored.
+  A date in the future, or one from before 2001, is ignored.
 
 ## [1.2.3] - 2026-08-21
 

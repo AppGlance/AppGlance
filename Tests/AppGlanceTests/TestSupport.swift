@@ -113,12 +113,17 @@ final class RecordingProtocol: URLProtocol {
     /// answer. A custom `URLProtocol` has to hand the redirect to the loading system itself; a
     /// `3xx` status alone is not one.
     nonisolated(unsafe) private static var redirectTo: URL?
+    /// When set, the next request fails with this error instead of being answered: the way a
+    /// request that never left the device fails (`.notConnectedToInternet`), or one that did and
+    /// was never answered (`.timedOut`).
+    nonisolated(unsafe) private static var failure: URLError.Code?
     private static let lock = NSLock()
 
     static func reset() {
         lock.lock(); defer { lock.unlock() }
         sent = []; batches = []; sessionIDs = []; statuses = []; requests = []; received = []; hold = nil
         redirectTo = nil
+        failure = nil
         responseHeaders = nil
         responseBody = "{}"
     }
@@ -141,6 +146,11 @@ final class RecordingProtocol: URLProtocol {
     /// host would.
     static func scriptRedirect(to url: URL) {
         lock.lock(); redirectTo = url; lock.unlock()
+    }
+
+    /// Fails the next request with `code` before any answer; the batch it carried is still recorded.
+    static func scriptFailure(_ code: URLError.Code) {
+        lock.lock(); failure = code; lock.unlock()
     }
 
     /// Holds the next request open until `proceed()` is called; `isStarted` turns true once it is in flight.
@@ -204,6 +214,15 @@ final class RecordingProtocol: URLProtocol {
 
         let batch = (try? EventCoding.makeDecoder().decode([Event].self, from: body)) ?? []
         Self.lock.lock()
+        if let failing = Self.failure {
+            Self.failure = nil
+            Self.batches.append(batch.count)
+            Self.requests.append(request)
+            Self.received.append(batch)
+            Self.lock.unlock()
+            client?.urlProtocol(self, didFailWithError: URLError(failing))
+            return
+        }
         let status = Self.statuses.isEmpty ? 202 : Self.statuses.removeFirst()
         let headers = Self.responseHeaders
         let answerBody = Self.responseBody

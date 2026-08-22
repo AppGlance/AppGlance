@@ -1,3 +1,4 @@
+import StoreKit
 import XCTest
 
 @testable import AppGlance
@@ -159,6 +160,116 @@ final class InstallOriginTests: XCTestCase {
         await TestSupport.settle(0.3)
         let carried = origins(await client.pendingEvents())
         XCTAssertEqual(carried.count, 1, "the origin waits for a carrier this run recorded")
+    }
+
+    /// An event this run put back after a failure the server may have applied is in the same
+    /// position as an inherited one: a 5xx or a timeout says nothing about whether the batch was
+    /// stored, and a replay of an id the server holds is ignored, metadata and all. The origin
+    /// waits for the next carrier instead.
+    func testACarrierTheServerMayAlreadyHoldIsNeverStamped() async throws {
+        let id = "test.origin.maybedelivered"; isolate(id)
+        let clock = TestClock()
+        let gate = StoreAnswerGate()
+        let client = makeClient(
+            appID: id, clock: clock, storeAnswer: { await gate.ask() }, environmentAnswerGrace: 0.2)
+
+        await client.recordInstallIfNeeded()
+        RecordingProtocol.script([503])
+        await client.flush()  // the grace runs out before the store answers; the send fails after the server saw it
+        let attempted = try XCTUnwrap(
+            RecordingProtocol.receivedBatches().first?.first { $0.signal == Signal.install })
+        let putBack = await client.pendingSignals()
+        XCTAssertEqual(putBack, [Signal.install], "put back for a retry")
+
+        gate.answer(
+            .appStore,
+            origin: InstallOrigin(firstInstalledAt: clock.now.addingTimeInterval(-500 * 24 * 3600), evidence: .store))
+        await TestSupport.settle(0.3)
+        let afterAnswer = await client.pendingEvents()
+        let requeued = try XCTUnwrap(afterAnswer.first { $0.event_id == attempted.event_id })
+        XCTAssertNil(requeued.metadata, "an id the server may hold is not rewritten")
+
+        await client.setActive(true)
+        await TestSupport.settle(0.2)
+        let queued = await client.pendingEvents()
+        let carrier = try XCTUnwrap(queued.first { $0.metadata?[InstallOrigin.Key.installedAt] != nil })
+        XCTAssertEqual(carrier.signal, Signal.sessionStart, "the origin rides the next carrier the server cannot hold")
+        XCTAssertEqual(origins(queued).count, 1)
+    }
+
+    /// The other half: a request that never left the device is one the server provably never saw,
+    /// so the event it carried is put back as good as new and a late answer may still ride it.
+    func testACarrierTheServerNeverSawIsStillStamped() async throws {
+        let id = "test.origin.neverconnected"; isolate(id)
+        let clock = TestClock()
+        let gate = StoreAnswerGate()
+        let client = makeClient(
+            appID: id, clock: clock, storeAnswer: { await gate.ask() }, environmentAnswerGrace: 0.2)
+
+        await client.recordInstallIfNeeded()
+        RecordingProtocol.scriptFailure(.notConnectedToInternet)
+        await client.flush()
+        let attempted = try XCTUnwrap(
+            RecordingProtocol.receivedBatches().first?.first { $0.signal == Signal.install })
+        let putBack = await client.pendingSignals()
+        XCTAssertEqual(putBack, [Signal.install])
+
+        gate.answer(
+            .appStore,
+            origin: InstallOrigin(firstInstalledAt: clock.now.addingTimeInterval(-500 * 24 * 3600), evidence: .store))
+        let landed = await TestSupport.waitUntilAsync { await !self.origins(client.pendingEvents()).isEmpty }
+        XCTAssertTrue(landed, "nothing on the server could have this id, so the install carries the origin")
+        let afterAnswer = await client.pendingEvents()
+        let stamped = try XCTUnwrap(afterAnswer.first { $0.signal == Signal.install })
+        XCTAssertEqual(stamped.event_id, attempted.event_id)
+    }
+
+    /// A gate that closes late drops this run's queue, `install` included, and writes that debt
+    /// back for the next collecting launch to pay. The origin on it goes back the same way: marked
+    /// sent at queue time, it would otherwise count as delivered by a run that delivered nothing,
+    /// and the re-recorded `install` would travel without it for good.
+    func testAGateThatClosesGivesTheOriginBack() async throws {
+        let id = "test.origin.gateclose"; isolate(id)
+        let clock = TestClock()
+        let gate = StoreAnswerGate()
+        var config = TestSupport.configuration(appID: id, enabledEnvironments: [AppEnvironment.current])
+        config.firstInstalledAt = clock.now.addingTimeInterval(-300 * 24 * 3600)
+        let client = Client(
+            config: config.withinBounds(), userID: "u-\(id)", isNewInstall: true, installAt: clock.now,
+            session: TestSupport.recordingSession(), now: { clock.now }, asksTheStore: true,
+            storeAnswer: { await gate.ask() })
+
+        await client.recordInstallIfNeeded()
+        let recorded = await client.pendingEvents()
+        XCTAssertEqual(origins(recorded).count, 1, "the app's date rode this run's install")
+        await client.beginEnvironmentRefinement()
+        let asked = await gate.waitUntilAsked()
+        XCTAssertTrue(asked)
+        gate.answer(.testFlight)  // not in enabledEnvironments: the gate closes on this run
+        await TestSupport.settle(0.3)
+        let dropped = await client.pendingEvents()
+        XCTAssertTrue(dropped.isEmpty, "the close dropped the queue")
+
+        let next = Client(
+            config: config.withinBounds(), userID: "u-\(id)", isNewInstall: false, installAt: clock.now,
+            session: TestSupport.recordingSession(), now: { clock.now }, asksTheStore: false)
+        await next.recordInstallIfNeeded()
+        let queued = await next.pendingEvents()
+        XCTAssertEqual(queued.map(\.signal), [Signal.install], "the next collecting launch pays the install debt")
+        XCTAssertEqual(origins(queued).count, 1, "and the origin travels with it")
+    }
+
+    /// Only a production transaction says when this Apple ID first got the app. The sandbox, which
+    /// TestFlight and StoreKit testing both run in, answers every account with one placeholder
+    /// purchase date and version, and a placeholder is not evidence.
+    func testOnlyAProductionTransactionCarriesTheStoreDate() {
+        let purchased = Date(timeIntervalSince1970: 1_375_340_400)
+        XCTAssertNil(AppEnvironment.storeOrigin(from: .sandbox, purchased: purchased, originalAppVersion: "1.0"))
+        XCTAssertNil(AppEnvironment.storeOrigin(from: .xcode, purchased: purchased, originalAppVersion: "1.0"))
+        let real = AppEnvironment.storeOrigin(from: .production, purchased: purchased, originalAppVersion: "312")
+        XCTAssertEqual(real?.firstInstalledAt, purchased)
+        XCTAssertEqual(real?.evidence, .store)
+        XCTAssertEqual(real?.originalAppVersion, "312")
     }
 
     /// The app's record outranks the store's: the store knows when this Apple ID first downloaded

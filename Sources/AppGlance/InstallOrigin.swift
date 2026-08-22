@@ -65,8 +65,14 @@ struct InstallOrigin: Equatable, Sendable {
     /// after the moment it was read, which reads downstream as a user who arrived tomorrow.
     /// Rejected here rather than clamped: a nonsense date is not evidence, and no evidence is a
     /// state the server already knows how to handle.
+    ///
+    /// The floor is the one the server applies. An install date cannot predate the platform, and
+    /// a signup date passed by the app that does is still evidence, so the floor is there only to
+    /// catch a clock that was never set and reads as 1970.
     func isPlausible(now: Date) -> Bool {
-        firstInstalledAt <= now.addingTimeInterval(60 * 60 * 24)
-            && firstInstalledAt > Date(timeIntervalSince1970: 1_000_000_000)  // 2001-09-09, before the App Store
+        firstInstalledAt <= now.addingTimeInterval(60 * 60 * 24) && firstInstalledAt > Self.earliestPlausible
     }
+
+    /// 2001-09-09, the same floor as the server's.
+    private static let earliestPlausible = Date(timeIntervalSince1970: 1_000_000_000)
 }

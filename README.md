@@ -187,10 +187,12 @@ Nothing to switch on. It costs no extra API call, needs no permission, and adds 
 App Store privacy answers: it is a date about the app, not about the person, sent once per
 install alongside the `install` event.
 
-Two things worth knowing:
+Three things worth knowing:
 
 - The store's date is per Apple ID, not per device. Someone who bought your app three years ago,
   deleted it and downloads it again today counts as already having had it - which is true.
+- TestFlight builds send no store date. The sandbox answers every account with the same
+  placeholder purchase date, so testers count as new unless your app passes a date of its own.
 - It cannot see further back than the App Store. If you keep your own signup or first-launch
   date, pass it as `firstInstalledAt` and it wins over the store's answer:
 

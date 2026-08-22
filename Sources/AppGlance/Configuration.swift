@@ -102,7 +102,7 @@ extension AppGlance {
         /// It is a date, never a name or an id, it is sent once per install, and it changes
         /// nothing about the events themselves: the dashboard uses it to sort a first sighting
         /// into "new" or "was already here" and for nothing else. A date in the future, or one
-        /// before the App Store existed, is ignored.
+        /// from before 2001, is ignored.
         public var firstInstalledAt: Date?
 
         /// Debug mode, for while you wire the SDK up. Default false. When on:

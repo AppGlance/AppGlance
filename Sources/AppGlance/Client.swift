@@ -35,6 +35,12 @@ actor Client {
     /// `adoptEnvironment`. Bounded by the queue cap, and empty on the ordinary launch that finds
     /// no file at all.
     private var inheritedEventIDs: Set<String>
+    /// The ids of the events this run put back in the queue after a failure the server may have
+    /// applied: a timeout, a connection lost mid-flight, a 5xx. The server may already hold any
+    /// of them and ignores a replay, so nothing added to one now could ever arrive - the origin
+    /// stamp passes them over, as it does inherited events. Cut down to the queue's own ids at
+    /// every requeue, so it is bounded by the queue cap however long an outage runs.
+    private var maybeDeliveredEventIDs: Set<String> = []
     /// The presence stamps this install had when the client started. They are the install's and
     /// not this run's - every build sharing the container reads them - and until the store has
     /// answered, this run does not know whether it was ever entitled to move them. See
@@ -212,6 +218,10 @@ actor Client {
     /// with the most to correct, so the first carrier after the upgrade backfills them.
     private let originSentKey: String
     private var originOwed: Bool
+    /// Whether the origin was still owed when the client started. With `originOwed`, it says
+    /// whether THIS run is the one that marked it sent, which is what a gate that closes late
+    /// needs to know: see `adoptEnvironment`.
+    private let startupOriginOwed: Bool
 
     /// Whether this build has anything to ask the store about. A compile-time environment
     /// (Simulator, Debug) has not, so the question is closed before it is opened. Injected rather
@@ -273,6 +283,7 @@ actor Client {
             if claimed.isPlausible(now: now()) { self.origin = claimed }
         }
         self.originOwed = !defaults.bool(forKey: originSentKey)
+        self.startupOriginOwed = self.originOwed
         if let floor = defaults.object(forKey: heartbeatFloorKey) as? Double, Self.isSaneHeartbeatFloor(floor) {
             self.serverHeartbeatFloor = floor
         }
@@ -587,11 +598,13 @@ actor Client {
     /// answer, so that event is nearly always still here when the answer lands. Anything not
     /// caught here waits for the next carrier `track` records.
     ///
-    /// Only an event THIS run recorded will do. An inherited one is an event an earlier run left
-    /// on disk, and the reason it is still there may be a lost acknowledgement rather than a lost
-    /// send: the server has seen that event id and ignores a replay of it, so metadata added to it
-    /// now would be dropped on arrival - silently, and for good, because the origin is marked sent
-    /// either way. Passing it over costs this install one session's delay and nothing else.
+    /// Only an event the server cannot already hold will do. An inherited one is an event an
+    /// earlier run left on disk, and the reason it is still there may be a lost acknowledgement
+    /// rather than a lost send; one this run put back after a timeout or a 5xx is in the same
+    /// position. The server has seen that event id and ignores a replay of it, so metadata added
+    /// to it now would be dropped on arrival - silently, and for good, because the origin is
+    /// marked sent either way. Passing it over costs this install one session's delay and nothing
+    /// else.
     ///
     /// Marked sent the moment it is queued rather than when it is delivered, the same way
     /// `install` is: a death in between costs this install one label, where clearing it after
@@ -603,6 +616,7 @@ actor Client {
         guard
             let index = queue.lastIndex(where: {
                 Self.carriesOrigin($0.signal) && !inheritedEventIDs.contains($0.event_id)
+                    && !maybeDeliveredEventIDs.contains($0.event_id)
             })
         else { return }
         queue[index] = queue[index].carrying(extra)
@@ -700,6 +714,19 @@ actor Client {
             {
                 installRecorded = false
                 UserDefaults.standard.set(true, forKey: installPendingKey)
+            }
+            // The origin this run stamped goes back on the books with it, and here the in-flight
+            // copy counts too: a carrier still on the wire may yet be accepted, and then the next
+            // carrier repeats a fact the server reconciles by keeping the earliest, whereas a
+            // claim dropped here would never be made again. Only what this run marked is
+            // un-marked; an earlier run's send stands.
+            if startupOriginOwed, !originOwed,
+                owedEvents.contains(where: {
+                    !inheritedEventIDs.contains($0.event_id) && $0.metadata?[InstallOrigin.Key.installedAt] != nil
+                })
+            {
+                originOwed = true
+                UserDefaults.standard.removeObject(forKey: originSentKey)
             }
             queue.removeAll()
             inFlightBatch.removeAll()
@@ -1548,6 +1575,10 @@ actor Client {
         }
         queue.insert(contentsOf: retryable, at: 0)
         trim()
+        // Heartbeats were kept only if the server definitely did not process the batch; the
+        // other case is exactly the one where these ids may already be on the server.
+        if !keepingHeartbeats { maybeDeliveredEventIDs.formUnion(retryable.map(\.event_id)) }
+        maybeDeliveredEventIDs.formIntersection(queue.map(\.event_id))
         persist()
     }
 
